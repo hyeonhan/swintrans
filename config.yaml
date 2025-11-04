@@ -1,0 +1,51 @@
+experiment_name: swin_dct_compare
+mode: auto            # one of: auto|rgb_only|dct_gate|cross_attn|late_fusion
+seed: 1337
+
+data:
+  root: ./data
+  img_size: 224
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  augment:
+    random_resized_crop: true
+    horizontal_flip: true
+    color_jitter: false
+
+training:
+  epochs: 5
+  batch_size: 32
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 2
+  label_smoothing: 0.0
+  amp: true
+  num_workers: 4
+  grad_clip: 1.0
+  early_stop_patience: 8
+
+model:
+  backbone: swin_tiny_patch4_window7_224
+  pretrained: true
+  dropout: 0.0
+
+dct:
+  block: 8
+  P: 5                 # number of coefficients per channel/token
+  selection: topk      # or 'lowfirst'
+  bands:               # indices (u,v) included in each band for energy maps
+    low: [[0,0],[0,1],[1,0],[1,1],[0,2],[2,0]]
+    mid: [[1,2],[2,1],[2,2],[0,3],[3,0],[1,3],[3,1]]
+    high: else         # everything not in low/mid
+
+fusion:
+  reduction: 4         # for dct_gate MLP
+  cross_attn:
+    num_heads: 4
+    bidirectional: false
+    drop: 0.0
+  late:
+    type: concat_mlp   # or 'gated_sum'
+    mlp_hidden: 512
+
