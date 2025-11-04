@@ -16,6 +16,14 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 
+def safe_torch_load(path, device):
+    """Safely load checkpoint with weights_only if available, fallback otherwise."""
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_proba: Optional[np.ndarray] = None) -> Dict[str, float]:
     """Compute classification metrics."""
     acc = accuracy_score(y_true, y_pred)
@@ -293,7 +301,7 @@ def train(
     # Load best model
     best_path = os.path.join(save_dir, 'best.pt')
     if os.path.exists(best_path):
-        checkpoint = torch.load(best_path)
+        checkpoint = safe_torch_load(best_path, device)
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Loaded best model from epoch {best_epoch} with F1={best_f1:.4f}")
     

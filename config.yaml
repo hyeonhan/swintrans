@@ -14,14 +14,14 @@ data:
 
 training:
   epochs: 5
-  batch_size: 32
+  batch_size: 128
   optimizer: adamw
   lr: 3.0e-4
   weight_decay: 0.05
   warmup_epochs: 2
   label_smoothing: 0.0
   amp: true
-  num_workers: 4
+  num_workers: 12
   grad_clip: 1.0
   early_stop_patience: 8
 

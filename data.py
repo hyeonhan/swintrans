@@ -9,6 +9,9 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 
+# Disable PIL image size limit to avoid decompression bomb warnings
+Image.MAX_IMAGE_PIXELS = None
+
 
 class FireDataset(Dataset):
     """Dataset for fire vs non-fire binary classification."""
@@ -46,6 +49,7 @@ class FireDataset(Dataset):
         # Load image paths
         split_dir = self.root / split
         self.samples = []
+        self.class_counts = {}
         
         # Determine actual directory names (support both nonfire and non_fire)
         # Check which directory name exists
@@ -60,12 +64,16 @@ class FireDataset(Dataset):
             dir_name = class_dirs[idx]
             class_dir = split_dir / dir_name
             if not class_dir.exists():
+                self.class_counts[class_name] = 0
                 continue
             
             label = self.class_to_idx[class_name]
+            count = 0
             for img_path in class_dir.glob('*'):
                 if img_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp']:
                     self.samples.append((str(img_path), label))
+                    count += 1
+            self.class_counts[class_name] = count
         
         # Build transforms
         if split == 'train' and augment_cfg:
@@ -165,6 +173,8 @@ def build_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
         drop_last=True
     )
     
@@ -174,8 +184,29 @@ def build_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
         drop_last=False
     )
+    
+    # Print beautiful file counts
+    print("\n" + "="*50)
+    print("Dataset Statistics")
+    print("="*50)
+    
+    # Train statistics
+    print(f"\ntrain:")
+    for class_name in ['fire', 'nonfire']:
+        count = train_dataset.class_counts.get(class_name, 0)
+        print(f"  {class_name}: {count}")
+    
+    # Validation statistics
+    print(f"\nval:")
+    for class_name in ['fire', 'nonfire']:
+        count = val_dataset.class_counts.get(class_name, 0)
+        print(f"  {class_name}: {count}")
+    
+    print("="*50 + "\n")
     
     return train_loader, val_loader
 
