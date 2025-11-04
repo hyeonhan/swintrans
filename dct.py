@@ -1,133 +1,279 @@
-"""Block-wise 8x8 DCT/IDCT utilities implemented with torch (no SciPy).
-
-Provides batched block DCT/IDCT and normalization utilities for RGB images.
 """
-from __future__ import annotations
-
-from typing import Optional, Tuple
-
-import math
+Pure PyTorch DCT utilities for 2D DCT/IDCT, block DCT, and energy maps.
+No SciPy dependency - uses separable cosine basis matrices.
+"""
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
+from typing import Dict, List, Tuple, Optional
 
 
-def _dct_basis_8(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Return orthonormal 8x8 DCT-II basis matrix C.
-
-    X_dct = C @ X @ C^T, with C orthonormal.
-    """
-    C = torch.zeros((8, 8), dtype=dtype, device=device)
-    for u in range(8):
-        for x in range(8):
-            alpha = math.sqrt(1.0 / 8.0) if u == 0 else math.sqrt(2.0 / 8.0)
-            C[u, x] = alpha * math.cos(((2 * x + 1) * u * math.pi) / 16.0)
-    return C
-
-
-def _unfold_blocks(x: torch.Tensor) -> torch.Tensor:
-    """Unfold (B,C,H,W) into 8x8 blocks -> (B,C,Hb,Wb,8,8)."""
-    B, C, H, W = x.shape
-    assert H % 8 == 0 and W % 8 == 0, "Input height and width must be multiples of 8"
-    Hb = H // 8
-    Wb = W // 8
-    # Use F.unfold to extract blocks, then reshape
-    patches = F.unfold(x, kernel_size=8, stride=8)  # (B, C*64, Hb*Wb)
-    patches = patches.transpose(1, 2)  # (B, Hb*Wb, C*64)
-    patches = patches.view(B, Hb, Wb, C, 8, 8)
-    patches = patches.permute(0, 3, 1, 2, 4, 5)  # (B,C,Hb,Wb,8,8)
-    return patches
-
-
-def _fold_blocks(blocks: torch.Tensor) -> torch.Tensor:
-    """Fold blocks (B,C,Hb,Wb,8,8) back to (B,C,H,W)."""
-    B, C, Hb, Wb, _, _ = blocks.shape
-    H = Hb * 8
-    W = Wb * 8
-    blocks = blocks.permute(0, 2, 3, 1, 4, 5).contiguous().view(B, Hb * Wb, C * 64)
-    blocks = blocks.transpose(1, 2)  # (B, C*64, Hb*Wb)
-    x = F.fold(blocks, output_size=(H, W), kernel_size=8, stride=8)
-    return x
-
-
-def block_dct(x: torch.Tensor, standardize: bool = True, clip_sigma: Optional[float] = 3.0) -> torch.Tensor:
-    """Compute 8x8 block-wise DCT for an RGB image batch.
-
-    Args:
-        x: Input tensor (B,3,H,W) with H,W multiples of 8.
-        standardize: If True, standardize coefficients per (batch,channel) using mean/std.
-        clip_sigma: If not None, clip to +/- clip_sigma * std after standardization.
-
-    Returns:
-        Tensor of shape (B, Hb, Wb, 3*64) where Hb=H/8, Wb=W/8.
-    """
-    assert x.dim() == 4 and x.size(1) == 3, "Input must be BCHW with 3 channels"
-    device = x.device
-    dtype = x.dtype
-    C = _dct_basis_8(device, dtype)
-    blocks = _unfold_blocks(x)  # (B,3,Hb,Wb,8,8)
-    # DCT: Y[u,v] = sum_{x,y} C[u,x] * X[x,y] * C[v,y]
-    Y = torch.einsum('ux,bchwxy->bchwuy', C, blocks)
-    Y = torch.einsum('vy,bchwuy->bchwuv', C, Y)
-    # Flatten 8x8 -> 64 per channel
-    Bsz, Cc, Hb, Wb, _, _ = Y.shape
-    Y = Y.reshape(Bsz, Cc, Hb, Wb, 64)
-    # Move channels last and merge color
-    Y = Y.permute(0, 2, 3, 1, 4).contiguous().view(Bsz, Hb, Wb, Cc * 64)
-
-    if standardize:
-        mean = Y.mean(dim=(1, 2), keepdim=True)
-        std = Y.std(dim=(1, 2), keepdim=True) + 1e-6
-        Y = (Y - mean) * (1.0 / std)
-        if clip_sigma is not None and clip_sigma > 0:
-            Y = torch.clamp(Y, -clip_sigma, clip_sigma)
-    return Y
-
-
-def block_idct(coeffs: torch.Tensor, orig_hw: Tuple[int, int]) -> torch.Tensor:
-    """Inverse block-wise DCT from flattened 3*64 to (B,3,H,W).
-
-    Args:
-        coeffs: (B,Hb,Wb,3*64)
-        orig_hw: (H, W) spatial size
-    """
-    B, Hb, Wb, C64 = coeffs.shape
-    assert C64 == 3 * 64, "Expected 3*64 coefficients"
-    C = _dct_basis_8(coeffs.device, coeffs.dtype)
-    # reshape back to (B,3,Hb,Wb,8,8)
-    Y = coeffs.view(B, Hb, Wb, 3, 64).permute(0, 3, 1, 2, 4)  # (B,3,Hb,Wb,64)
-    Y = Y.view(B, 3, Hb, Wb, 8, 8)
-    # X = C^T @ Y @ C  (inverse for orthonormal DCT)
-    Ct = C.t()
-    X = torch.einsum('xu,bchwuv->bchwxv', Ct, Y)
-    X = torch.einsum('yv,bchwxv->bchwxy', Ct, X)
-    X = _fold_blocks(X)  # (B,3,H,W)
-    H, W = orig_hw
-    return X[:, :, :H, :W]
-
-
-class LearnableMask(torch.nn.Module):
-    """Learnable per-color DCT coefficient mask of length 64 (sigmoid)."""
-
-    def __init__(self, init: float = 0.0) -> None:
+class DCT2D(nn.Module):
+    """2D DCT-II transform using separable cosine matrices."""
+    
+    def __init__(self):
         super().__init__()
-        self.mask_r = torch.nn.Parameter(torch.full((64,), init))
-        self.mask_g = torch.nn.Parameter(torch.full((64,), init))
-        self.mask_b = torch.nn.Parameter(torch.full((64,), init))
-
-    def forward(self, coeffs: torch.Tensor) -> torch.Tensor:
-        """Apply sigmoid(mask) elementwise to coeffs per color.
-
-        Args:
-            coeffs: (B, Hb, Wb, 3*64)
-        Returns:
-            Tensor (B, Hb, Wb, 3*64)
+        self._cosine_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+    
+    def _get_cosine_matrix(self, size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Compute or retrieve cached cosine basis matrix for DCT-II."""
+        cache_key = (size, device.type)
+        if cache_key not in self._cosine_cache:
+            # DCT-II: C[u,v] = sqrt(2/N) * cos(pi * (2k+1) * u / (2N)) for u>0
+            # For u=0: sqrt(1/N)
+            n = size
+            k = torch.arange(n, device=device, dtype=dtype).unsqueeze(0)  # [1, n]
+            u = torch.arange(n, device=device, dtype=dtype).unsqueeze(1)  # [n, 1]
+            
+            # Scale factors
+            scale = torch.ones(n, device=device, dtype=dtype)
+            scale[0] = 1.0 / torch.sqrt(torch.tensor(n, dtype=dtype, device=device))
+            scale[1:] = torch.sqrt(torch.tensor(2.0 / n, dtype=dtype, device=device))
+            
+            # Cosine matrix: C[u,k] = scale[u] * cos(pi * (2k+1) * u / (2n))
+            cos_matrix = scale.unsqueeze(1) * torch.cos(
+                torch.pi * (2 * k + 1) * u / (2 * n)
+            )
+            self._cosine_cache[cache_key] = cos_matrix
+        
+        return self._cosine_cache[cache_key]
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        B, Hb, Wb, C64 = coeffs.shape
-        assert C64 == 3 * 64
-        r = coeffs[..., 0:64] * torch.sigmoid(self.mask_r)
-        g = coeffs[..., 64:128] * torch.sigmoid(self.mask_g)
-        b = coeffs[..., 128:192] * torch.sigmoid(self.mask_b)
-        return torch.cat([r, g, b], dim=-1)
+        Apply 2D DCT-II to input [B, C, H, W] or [B, 1, H, W].
+        Returns coefficients [B, C, H, W].
+        """
+        if x.dim() == 3:
+            x = x.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
+        
+        B, C, H, W = x.shape
+        device, dtype = x.device, x.dtype
+        
+        # Get cosine matrices
+        cos_h = self._get_cosine_matrix(H, device, dtype)  # [H, H]
+        cos_w = self._get_cosine_matrix(W, device, dtype)  # [W, W]
+        
+        # Separable 2D DCT: DCT2(x) = cos_h @ x @ cos_w^T
+        # Reshape: [B, C, H, W] -> [B*C, H, W]
+        x_flat = x.view(B * C, H, W)
+        
+        # Apply DCT along height: [B*C, H, W] -> [B*C, H, W]
+        dct_h = torch.einsum('ij,bjk->bik', cos_h, x_flat)
+        
+        # Apply DCT along width: [B*C, H, W] -> [B*C, H, W]
+        dct_2d = torch.einsum('bij,jk->bik', dct_h, cos_w.t())
+        
+        # Reshape back: [B*C, H, W] -> [B, C, H, W]
+        return dct_2d.view(B, C, H, W)
 
 
+class IDCT2D(nn.Module):
+    """2D IDCT-III (inverse of DCT-II) using separable cosine matrices."""
+    
+    def __init__(self):
+        super().__init__()
+        self._cosine_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+    
+    def _get_cosine_matrix(self, size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Compute or retrieve cached cosine basis matrix for IDCT-III."""
+        cache_key = (size, device.type)
+        if cache_key not in self._cosine_cache:
+            # IDCT-III: C[k,u] = sqrt(2/N) * cos(pi * (2k+1) * u / (2N)) for u>0
+            # For u=0: sqrt(1/N)
+            n = size
+            k = torch.arange(n, device=device, dtype=dtype).unsqueeze(0)  # [1, n]
+            u = torch.arange(n, device=device, dtype=dtype).unsqueeze(1)  # [n, 1]
+            
+            # Scale factors (same as DCT-II for orthonormal transform)
+            scale = torch.ones(n, device=device, dtype=dtype)
+            scale[0] = 1.0 / torch.sqrt(torch.tensor(n, dtype=dtype, device=device))
+            scale[1:] = torch.sqrt(torch.tensor(2.0 / n, dtype=dtype, device=device))
+            
+            # Cosine matrix: C[k,u] = scale[u] * cos(pi * (2k+1) * u / (2n))
+            cos_matrix = scale.unsqueeze(1) * torch.cos(
+                torch.pi * (2 * k + 1) * u / (2 * n)
+            )
+            self._cosine_cache[cache_key] = cos_matrix
+        
+        return self._cosine_cache[cache_key]
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply 2D IDCT-III to input [B, C, H, W].
+        Returns reconstructed image [B, C, H, W].
+        """
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        
+        B, C, H, W = x.shape
+        device, dtype = x.device, x.dtype
+        
+        # Get cosine matrices
+        cos_h = self._get_cosine_matrix(H, device, dtype)  # [H, H]
+        cos_w = self._get_cosine_matrix(W, device, dtype)  # [W, W]
+        
+        # Separable 2D IDCT: IDCT2(x) = cos_h^T @ x @ cos_w
+        x_flat = x.view(B * C, H, W)
+        
+        # Apply IDCT along height
+        idct_h = torch.einsum('ij,bjk->bik', cos_h.t(), x_flat)
+        
+        # Apply IDCT along width
+        idct_2d = torch.einsum('bij,jk->bik', idct_h, cos_w)
+        
+        return idct_2d.view(B, C, H, W)
+
+
+def block_dct_8x8(gray: torch.Tensor) -> torch.Tensor:
+    """
+    Apply 8x8 block DCT to grayscale image.
+    
+    Args:
+        gray: [B, 1, H, W] grayscale image
+        
+    Returns:
+        coeff: [B, H//8, W//8, 8, 8] DCT coefficients per block
+    """
+    B, C, H, W = gray.shape
+    assert C == 1, "Expected single channel grayscale"
+    assert H % 8 == 0 and W % 8 == 0, f"Image size ({H}, {W}) must be divisible by 8"
+    
+    dct2d = DCT2D()
+    
+    # Reshape into blocks: [B, 1, H, W] -> [B, H//8, 8, W//8, 8]
+    blocks = gray.view(B, 1, H // 8, 8, W // 8, 8)
+    blocks = blocks.permute(0, 2, 4, 1, 3, 5).contiguous()  # [B, H//8, W//8, 1, 8, 8]
+    
+    # Flatten block dimension: [B, H//8, W//8, 1, 8, 8] -> [B*H//8*W//8, 1, 8, 8]
+    n_blocks = B * (H // 8) * (W // 8)
+    blocks_flat = blocks.view(n_blocks, 1, 8, 8)
+    
+    # Apply DCT to each block
+    coeff_flat = dct2d(blocks_flat)  # [n_blocks, 1, 8, 8]
+    
+    # Reshape back: [n_blocks, 1, 8, 8] -> [B, H//8, W//8, 8, 8]
+    coeff = coeff_flat.view(B, H // 8, W // 8, 8, 8)
+    
+    return coeff
+
+
+def select_coeffs(coeff: torch.Tensor, selection: str = 'topk', k: int = 5) -> torch.Tensor:
+    """
+    Select coefficients from 8x8 DCT blocks.
+    
+    Args:
+        coeff: [B, H//8, W//8, 8, 8] DCT coefficients
+        selection: 'topk' (by magnitude) or 'lowfirst' (low-frequency order)
+        k: number of coefficients to select (including DC)
+        
+    Returns:
+        selected: [B, H//8, W//8, k] selected coefficients (DC always first)
+    """
+    B, h, w, block_h, block_w = coeff.shape
+    assert block_h == 8 and block_w == 8
+    
+    # Flatten block: [B, h, w, 8, 8] -> [B, h, w, 64]
+    coeff_flat = coeff.view(B, h, w, 64)
+    
+    if selection == 'lowfirst':
+        # Low-frequency order: zigzag pattern
+        # DC is [0,0], then [0,1], [1,0], [2,0], [1,1], [0,2], ...
+        # Create zigzag order indices for 8x8 block
+        zigzag_order = [
+            0,  1,  8, 16,  9,  2,  3, 10,
+            17, 24, 32, 25, 18, 11,  4,  5,
+            12, 19, 26, 33, 40, 48, 41, 34,
+            27, 20, 13,  6,  7, 14, 21, 28,
+            35, 42, 49, 56, 57, 50, 43, 36,
+            29, 22, 15, 23, 30, 37, 44, 51,
+            58, 59, 52, 45, 38, 31, 39, 46,
+            53, 60, 61, 54, 47, 55, 62, 63
+        ]
+        
+        # Take first k indices from zigzag order
+        selected_indices = zigzag_order[:k]
+        indices_tensor = torch.tensor(selected_indices, dtype=torch.long, device=coeff.device)
+        indices = indices_tensor.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(B, h, w, k)
+        
+        selected = torch.gather(coeff_flat, dim=3, index=indices)
+        
+    else:  # 'topk'
+        # Select DC + top (k-1) by magnitude
+        dc = coeff_flat[:, :, :, 0:1]  # [B, h, w, 1]
+        ac = coeff_flat[:, :, :, 1:]   # [B, h, w, 63]
+        
+        # Get top-k-1 by magnitude
+        ac_mag = torch.abs(ac)  # [B, h, w, 63]
+        _, top_indices = torch.topk(ac_mag, k=k-1, dim=3)  # [B, h, w, k-1]
+        
+        # Gather top AC coefficients
+        top_ac = torch.gather(ac, dim=3, index=top_indices)  # [B, h, w, k-1]
+        
+        # Concatenate DC + top AC
+        selected = torch.cat([dc, top_ac], dim=3)  # [B, h, w, k]
+    
+    return selected
+
+
+def band_energy_maps(coeff: torch.Tensor, bands_cfg: Dict) -> torch.Tensor:
+    """
+    Compute band energy maps from 8x8 DCT coefficients.
+    
+    Args:
+        coeff: [B, H//8, W//8, 8, 8] DCT coefficients
+        bands_cfg: dict with 'low', 'mid', 'high' band definitions
+        
+    Returns:
+        energy_maps: [B, 3, H, W] low/mid/high energy maps (upsampled to original size)
+    """
+    B, h, w, block_h, block_w = coeff.shape
+    assert block_h == 8 and block_w == 8
+    
+    H, W = h * 8, w * 8
+    
+    # Parse band indices
+    low_bands = set(tuple(b) for b in bands_cfg.get('low', []))
+    mid_bands = set(tuple(b) for b in bands_cfg.get('mid', []))
+    
+    # Compute squared magnitudes
+    coeff_sq = coeff ** 2  # [B, h, w, 8, 8]
+    
+    # Initialize energy maps
+    low_energy = torch.zeros(B, h, w, device=coeff.device, dtype=coeff.dtype)
+    mid_energy = torch.zeros(B, h, w, device=coeff.device, dtype=coeff.dtype)
+    high_energy = torch.zeros(B, h, w, device=coeff.device, dtype=coeff.dtype)
+    
+    # Aggregate energies per band
+    for u in range(8):
+        for v in range(8):
+            if (u, v) in low_bands:
+                low_energy += coeff_sq[:, :, :, u, v]
+            elif (u, v) in mid_bands:
+                mid_energy += coeff_sq[:, :, :, u, v]
+            else:
+                high_energy += coeff_sq[:, :, :, u, v]
+    
+    # Stack: [B, h, w] -> [B, 3, h, w]
+    energy_maps = torch.stack([low_energy, mid_energy, high_energy], dim=1)
+    
+    # Upsample to original size using nearest neighbor
+    energy_maps = torch.nn.functional.interpolate(
+        energy_maps, size=(H, W), mode='nearest'
+    )
+    
+    return energy_maps
+
+
+# Module instances for reuse
+_dct2d_instance = DCT2D()
+_idct2d_instance = IDCT2D()
+
+
+def dct2(x: torch.Tensor) -> torch.Tensor:
+    """Convenience function for 2D DCT."""
+    return _dct2d_instance(x)
+
+
+def idct2(x: torch.Tensor) -> torch.Tensor:
+    """Convenience function for 2D IDCT."""
+    return _idct2d_instance(x)
 
