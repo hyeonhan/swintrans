@@ -14,6 +14,21 @@ from typing import Dict, Optional
 from dct import block_dct_8x8, select_coeffs, band_energy_maps
 
 
+def _ensure_channel_first(features: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure features are in channel-first format [B, C, H, W].
+    If input is channel-last [B, H, W, C], permute to channel-first.
+    """
+    if len(features.shape) == 4:
+        B, dim1, dim2, dim3 = features.shape
+        # In channel-last format, dim1 and dim2 are both spatial (H, W) and should be similar
+        # In channel-first format, dim1 is channels (C) which differs from dim2 (H)
+        is_channel_last = abs(dim1 - dim2) <= max(dim1, dim2) // 4  # H and W are similar
+        if is_channel_last:
+            features = features.permute(0, 3, 1, 2)
+    return features
+
+
 class DCTChannelAttention(nn.Module):
     """DCT-based Channel Attention module."""
     
@@ -104,9 +119,9 @@ class RGBOnlySwin(nn.Module):
             dummy = torch.zeros(1, 3, 224, 224)
             features = self.backbone(dummy)
             if isinstance(features, (list, tuple)):
-                feature_dim = features[-1].shape[1]
-            else:
-                feature_dim = features.shape[1]
+                features = features[-1]
+            features = _ensure_channel_first(features)
+            feature_dim = features.shape[1]  # Now guaranteed to be [B, C, H, W]
         
         # Global average pooling + classifier
         self.classifier = nn.Sequential(
@@ -120,7 +135,7 @@ class RGBOnlySwin(nn.Module):
         features = self.backbone(x)
         if isinstance(features, (list, tuple)):
             features = features[-1]
-        # Features are [B, C, H, W] from Swin
+        features = _ensure_channel_first(features)
         logits = self.classifier(features)
         return logits
 
@@ -168,9 +183,8 @@ class SwinWithDCTGate(nn.Module):
         if isinstance(features, (list, tuple)):
             # Apply attention to last stage
             features = features[-1]
-            features = self.stage_attentions[-1](features)
-        else:
-            features = self.stage_attentions[-1](features)
+        features = _ensure_channel_first(features)
+        features = self.stage_attentions[-1](features)
         
         logits = self.classifier(features)
         return logits
@@ -235,9 +249,9 @@ class SwinCrossAttention(nn.Module):
             dummy = torch.zeros(1, 3, 224, 224)
             features = self.backbone(dummy)
             if isinstance(features, (list, tuple)):
-                feature_dim = features[-1].shape[1]
-            else:
-                feature_dim = features.shape[1]
+                features = features[-1]
+            features = _ensure_channel_first(features)
+            feature_dim = features.shape[1]  # Now guaranteed to be [B, C, H, W]
         
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -280,6 +294,8 @@ class SwinCrossAttention(nn.Module):
             rgb_features = features[-1]  # [B, C, H/32, W/32] typically
         else:
             rgb_features = features
+        
+        rgb_features = _ensure_channel_first(rgb_features)
         
         # Convert to tokens: [B, C, H, W] -> [B, H*W, C]
         B_rgb, C_rgb, H_rgb, W_rgb = rgb_features.shape
@@ -354,9 +370,9 @@ class TwoTowerLateFusion(nn.Module):
             dummy = torch.zeros(1, 3, 224, 224)
             rgb_feat = self.rgb_backbone(dummy)
             if isinstance(rgb_feat, (list, tuple)):
-                rgb_dim = rgb_feat[-1].shape[1]
-            else:
-                rgb_dim = rgb_feat.shape[1]
+                rgb_feat = rgb_feat[-1]
+            rgb_feat = _ensure_channel_first(rgb_feat)
+            rgb_dim = rgb_feat.shape[1]  # Now guaranteed to be [B, C, H, W]
         
         self.rgb_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -395,6 +411,7 @@ class TwoTowerLateFusion(nn.Module):
         rgb_feat = self.rgb_backbone(x)
         if isinstance(rgb_feat, (list, tuple)):
             rgb_feat = rgb_feat[-1]
+        rgb_feat = _ensure_channel_first(rgb_feat)
         rgb_vec = self.rgb_pool(rgb_feat)  # [B, rgb_dim]
         
         # DCT tower
