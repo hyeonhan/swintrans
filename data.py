@@ -378,6 +378,13 @@ class FireDataset(Dataset):
             if fog_section:
                 self.fog_cfg = fog_section
         
+        # Extract DCT config with robust fallbacks
+        self.dct_cfg = {}
+        if cfg is not None:
+            dct_section = cfg.get("dct", {})
+            if dct_section:
+                self.dct_cfg = dct_section
+        
         # Determine if fog duplication is enabled (only for train split)
         fog_enabled = self.fog_cfg.get("enabled", False)
         fog_duplicate = self.fog_cfg.get("duplicate", False)
@@ -563,13 +570,18 @@ class FireDataset(Dataset):
             gray = 0.299 * rgb_for_dct[0] + 0.587 * rgb_for_dct[1] + 0.114 * rgb_for_dct[2]  # [H, W]
             gray = gray.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
             
-            # Compute initial band maps with default c1=2.0, c2=4.0
+            # Read DCT parameters from config (with fallback defaults)
+            c1_init_val = self.dct_cfg.get("c1_init", 2.0)
+            c2_init_val = self.dct_cfg.get("c2_init", 4.0)
+            dct_k_val = self.dct_cfg.get("k", 50.0)
+            
+            # Compute initial band maps with config values
             # The model will recompute these with learnable c1, c2 during forward for gradients
-            c1_init = torch.tensor(2.0, device=gray.device)
-            c2_init = torch.tensor(4.0, device=gray.device)
+            c1_init = torch.tensor(c1_init_val, device=gray.device)
+            c2_init = torch.tensor(c2_init_val, device=gray.device)
             D_device = self.D.to(device=gray.device, dtype=gray.dtype)
             band_low, band_mid, band_high = band_split_idct(
-                gray, c1_init, c2_init, D_device, k=50.0
+                gray, c1_init, c2_init, D_device, k=dct_k_val
             )
             
             # Remove batch dimension: [1, 1, H, W] -> [1, H, W]

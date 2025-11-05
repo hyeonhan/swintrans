@@ -26,9 +26,9 @@ train:
   warmup_epochs: 5
 
 dct:
-  c1_init: 2.0
-  c2_init: 4.0
-  k: 50.0
+  c1_init: 3.0  # Initial threshold for low/high frequency boundary (used in data loader and FusionResNetSwin)
+  c2_init: 6.0  # Initial threshold for mid/high frequency boundary (used in data loader and FusionResNetSwin)
+  k: 50.0  # Slope parameter for sigmoid masks in band splitting (used in data loader and FusionResNetSwin)
 
 optim:
   lr: 3e-4
