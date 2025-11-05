@@ -361,6 +361,7 @@ def train(cfg: Dict):
         mode=mode,
         dct_block=cfg["data"].get("dct_block", 8),
         use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+        cfg=cfg,
     )
     val_dataset = FireDataset(
         root_dir=cfg["data"]["root"],
@@ -371,7 +372,12 @@ def train(cfg: Dict):
         mode=mode,
         dct_block=cfg["data"].get("dct_block", 8),
         use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+        cfg=cfg,
     )
+    
+    # Print effective dataset lengths
+    console.print(f"[cyan]Train dataset length: {len(train_dataset)}")
+    console.print(f"[cyan]Val dataset length: {len(val_dataset)}")
     
     from data import collate_fn
     
@@ -538,6 +544,7 @@ def validate(cfg: Dict):
         mode=mode,
         dct_block=cfg["data"].get("dct_block", 8),
         use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+        cfg=cfg,
     )
     
     from data import collate_fn

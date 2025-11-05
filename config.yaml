@@ -3,7 +3,7 @@ experiment:
   seed: 42
 
 run:
-  mode: rgb_swin  # one of ["rgb_resnet","rgb_swin","rgbswin_dctswin","rgbresnet_dctswin"]
+  mode: rgb_resnet  # one of ["rgb_resnet","rgb_swin","rgbswin_dctswin","rgbresnet_dctswin"]
 
 data:
   root: ./data
@@ -34,7 +34,7 @@ optim:
   lr: 3e-4
   weight_decay: 0.05
   betas: [0.9, 0.999]
-  epochs: 1
+  epochs: 30
   label_smoothing: 0.05
   loss: ce  # ce or focal
   focal_gamma: 2.0
@@ -44,4 +44,24 @@ logging:
   log_interval: 10
   tensorboard: true
   save_best_metric: acc1  # acc1 or f1_macro
+
+augment:
+  fog:
+    enabled: true  # master switch
+    duplicate: true  # doubles dataset by adding fogged copies
+    apply_to: "both"  # "rgb_only" | "both"
+    beta_range: [0.03, 0.10]  # attenuation β ~ thicker fog when higher
+    airlight_scalar_range: [0.9, 1.0]  # sampled if not using RGB tuple
+    use_rgb_airlight: false  # if true, sample per-channel airlight
+    airlight_rgb_low: [0.90, 0.92, 0.94]
+    airlight_rgb_high: [0.98, 0.99, 1.00]
+    depth_mode_probs: {contrast: 0.6, gradient: 0.3, flat: 0.1}
+    grad_angle_range: [0, 180]
+    contrast_radius_range: [7, 15]
+    contrast_gain_range: [0.8, 1.6]
+    bloom_strength_range: [0.0, 0.3]
+    bloom_th: 0.75
+    bloom_radius: 9
+    seed: 1337
+    debug_dump_first_n: 0  # >0 to save side-by-side samples for sanity check
 
