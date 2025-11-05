@@ -385,10 +385,12 @@ class FireDataset(Dataset):
             if dct_section:
                 self.dct_cfg = dct_section
         
-        # Determine if fog duplication is enabled (only for train split)
+        # Determine if fog duplication is enabled
+        # When enabled, creates 4 variants: original, fog, flip, fog+flip
         fog_enabled = self.fog_cfg.get("enabled", False)
         fog_duplicate = self.fog_cfg.get("duplicate", False)
-        self.duplication_enabled = (self.split == "train") and fog_enabled and fog_duplicate
+        # Apply to both train and val if enabled
+        self.duplication_enabled = fog_enabled and fog_duplicate
         
         # Store original length before duplication
         self._orig_len = None  # Will be set after samples are collected
@@ -431,11 +433,20 @@ class FireDataset(Dataset):
         # This allows us to apply fog augmentation before ToTensor
         if self.augment:
             # Geometric transforms (before fog)
-            self.rgb_geom_transform = transforms.Compose([
-                transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-            ])
+            # When duplication is enabled, we explicitly control horizontal flip,
+            # so remove RandomHorizontalFlip from the transform pipeline
+            if self.duplication_enabled:
+                self.rgb_geom_transform = transforms.Compose([
+                    transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
+                    # Note: Horizontal flip is handled explicitly in __getitem__
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                ])
+            else:
+                self.rgb_geom_transform = transforms.Compose([
+                    transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
+                    transforms.RandomHorizontalFlip(p=0.5),
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                ])
         else:
             self.rgb_geom_transform = transforms.Compose([
                 transforms.Resize(256),
@@ -467,11 +478,11 @@ class FireDataset(Dataset):
         # Log fog duplication status
         if self.duplication_enabled:
             apply_to = self.fog_cfg.get("apply_to", "both")
-            print(f"Fog Duplication active: train length x2, apply_to={apply_to}")
+            print(f"Fog Duplication active ({self.split}): length x4 (original, fog, flip, fog+flip), apply_to={apply_to}")
     
     def __len__(self) -> int:
         if self.duplication_enabled:
-            return 2 * self._orig_len
+            return 4 * self._orig_len  # 4 variants: original, fog, flip, fog+flip
         return len(self.samples)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
@@ -482,13 +493,22 @@ class FireDataset(Dataset):
                 - dct: [3, H, W] DCT tensor (or None if mode doesn't need DCT)
                 - label: class index (int)
         """
-        # Handle duplication: map idx to source index
+        # Handle duplication: map idx to source index and variant type
+        # Variants: 0=original, 1=fog, 2=flip, 3=fog+flip
         if self.duplication_enabled:
             src_idx = idx % self._orig_len
-            is_fogged = idx >= self._orig_len
+            variant = idx // self._orig_len  # 0, 1, 2, or 3
+            apply_flip = variant in [2, 3]  # Variants 2 and 3 are flipped
+            apply_fog = variant in [1, 3]   # Variants 1 and 3 have fog
         else:
             src_idx = idx
-            is_fogged = False
+            variant = 0
+            apply_flip = False
+            apply_fog = False
+            fog_enabled = self.fog_cfg.get("enabled", False)
+            # If fog enabled but duplication disabled, apply fog randomly (old behavior)
+            if fog_enabled and self.split == "train":
+                apply_fog = True
         
         img_path, label = self.samples[src_idx]
         
@@ -498,17 +518,14 @@ class FireDataset(Dataset):
         except Exception as e:
             raise ValueError(f"Failed to load image {img_path}: {e}")
         
-        # Apply geometric transforms (before fog)
+        # Apply geometric transforms (before fog and explicit flip)
         img_geom = self.rgb_geom_transform(img)
         
-        # Apply fog augmentation if needed
-        fog_enabled = self.fog_cfg.get("enabled", False)
-        # Apply fog if: (1) duplication enabled and this is the fogged duplicate, or
-        # (2) fog enabled but duplication disabled (apply fog to all train samples)
-        apply_fog = fog_enabled and (
-            (self.duplication_enabled and is_fogged) or
-            (self.split == "train" and not self.duplication_enabled)
-        )
+        # Apply explicit horizontal flip if needed (when duplication enabled)
+        if self.duplication_enabled and apply_flip:
+            img_geom = img_geom.transpose(Image.FLIP_LEFT_RIGHT)
+        
+        # Apply fog augmentation if needed (apply_fog already determined above)
         
         if apply_fog:
             # Convert PIL to numpy float32 [0, 1] HWC
@@ -528,21 +545,29 @@ class FireDataset(Dataset):
         else:
             img_final = img_geom
         
-        # Debug dump (only once per source index, for train split)
-        if self.split == "train":
-            debug_n = self.fog_cfg.get("debug_dump_first_n", 0)
-            if debug_n > 0 and src_idx < debug_n:
-                debug_dir = Path("runs/fog_debug") / self.split
-                debug_dir.mkdir(parents=True, exist_ok=True)
+        # Debug dump (only once per source index and variant)
+        debug_n = self.fog_cfg.get("debug_dump_first_n", 0)
+        if debug_n > 0 and src_idx < debug_n:
+            debug_dir = Path("runs/fog_debug") / self.split
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            
+            variant_names = ["orig", "fog", "flip", "fogflip"]
+            if self.duplication_enabled:
+                variant_name = variant_names[variant]
+                dump_key = f"{src_idx}_{variant}"
                 
-                # Save original (only once per source index)
-                if not is_fogged and src_idx not in self._debug_dumped_indices:
+                if dump_key not in self._debug_dumped_indices:
+                    dump_path = debug_dir / f"idx_{src_idx:05d}_{variant_name}.png"
+                    img_final.save(dump_path)
+                    self._debug_dumped_indices.add(dump_key)
+            else:
+                # Old behavior: save original and fogged separately
+                if not apply_fog and src_idx not in self._debug_dumped_indices:
                     orig_path = debug_dir / f"idx_{src_idx:05d}_orig.png"
                     img_geom.save(orig_path)
                     self._debug_dumped_indices.add(src_idx)
                 
-                # Save fogged if applicable (only once per source index)
-                if apply_fog and is_fogged:
+                if apply_fog:
                     fog_path = debug_dir / f"idx_{src_idx:05d}_fog.png"
                     img_final.save(fog_path)
         
@@ -555,15 +580,23 @@ class FireDataset(Dataset):
         # Compute DCT if needed
         dct = None
         if self.needs_dct:
-            # Determine if DCT should use fogged image
+            # Determine if DCT should use processed image (fogged/flipped)
             apply_to = self.fog_cfg.get("apply_to", "both")
-            use_fogged_for_dct = (apply_to == "both") and apply_fog
             
-            if use_fogged_for_dct:
-                # Use the same RGB (already fogged) for DCT computation
+            # When duplication is enabled and apply_to="both", all variants should use processed RGB
+            # When duplication disabled, use processed RGB only if fog is applied and apply_to="both"
+            if self.duplication_enabled:
+                # All variants use processed RGB when apply_to="both"
+                use_processed_for_dct = (apply_to == "both")
+            else:
+                # Only use processed RGB if fog is applied and apply_to="both"
+                use_processed_for_dct = (apply_to == "both") and apply_fog
+            
+            if use_processed_for_dct:
+                # Use the same RGB (already processed) for DCT computation
                 rgb_for_dct = rgb
             else:
-                # Use original RGB (recompute from geometric transform only)
+                # Use original RGB (recompute from geometric transform only, no flip/fog)
                 rgb_for_dct = self.rgb_to_tensor(img_geom)
             
             # Convert to grayscale for DCT (luma: 0.299R + 0.587G + 0.114B)

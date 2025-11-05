@@ -7,10 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 import os
 from pathlib import Path
 import time
+import numpy as np
 
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
 from rich.console import Console
@@ -244,8 +245,17 @@ def validate_epoch(
     epoch: int,
     writer: Optional[SummaryWriter] = None,
     cfg: Optional[Dict] = None,
-) -> Dict[str, float]:
-    """Validate for one epoch."""
+    return_predictions: bool = False,
+) -> Dict:
+    """
+    Validate for one epoch.
+    
+    Args:
+        return_predictions: If True, also return predictions and probabilities
+        
+    Returns:
+        Dictionary with metrics, and optionally predictions/probabilities
+    """
     model.eval()
     
     total_loss = 0.0
@@ -298,7 +308,165 @@ def validate_epoch(
             writer.add_scalar("Val/DCT_c1", c1.item(), epoch)
             writer.add_scalar("Val/DCT_c2", c2.item(), epoch)
     
-    return metrics
+    result = metrics.copy()
+    
+    if return_predictions:
+        probs = torch.softmax(all_outputs, dim=1)
+        preds = all_outputs.argmax(dim=1)
+        result["predictions"] = preds.cpu()
+        result["probabilities"] = probs.cpu()
+        result["targets"] = all_targets.cpu()
+    
+    return result
+
+
+def compute_confusion_matrix(predictions: torch.Tensor, targets: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """
+    Compute confusion matrix.
+    
+    Args:
+        predictions: Predicted class indices [N]
+        targets: True class indices [N]
+        num_classes: Number of classes
+        
+    Returns:
+        Confusion matrix [num_classes, num_classes] where cm[i, j] = count of class i predicted as class j
+    """
+    cm = torch.zeros(num_classes, num_classes, dtype=torch.long)
+    for i in range(num_classes):
+        for j in range(num_classes):
+            cm[i, j] = ((targets == i) & (predictions == j)).sum().item()
+    return cm
+
+
+def find_optimal_threshold(probabilities: torch.Tensor, targets: torch.Tensor, num_classes: int) -> Tuple[float, float]:
+    """
+    Find optimal threshold for binary classification by maximizing F1 score.
+    
+    Args:
+        probabilities: Class probabilities [N, num_classes]
+        targets: True class indices [N]
+        num_classes: Number of classes (must be 2 for threshold finding)
+        
+    Returns:
+        Tuple of (optimal_threshold, best_f1_score)
+    """
+    if num_classes != 2:
+        # For multi-class, return default threshold of 0.5
+        return 0.5, 0.0
+    
+    # Get probabilities for positive class (class 1)
+    pos_probs = probabilities[:, 1].numpy()
+    targets_np = targets.numpy()
+    
+    # Try different thresholds
+    thresholds = np.linspace(0.0, 1.0, 101)
+    best_threshold = 0.5
+    best_f1 = 0.0
+    
+    for thresh in thresholds:
+        preds = (pos_probs >= thresh).astype(int)
+        
+        # Compute F1 score
+        tp = np.sum((preds == 1) & (targets_np == 1))
+        fp = np.sum((preds == 1) & (targets_np == 0))
+        fn = np.sum((preds == 0) & (targets_np == 1))
+        
+        precision = tp / (tp + fp + 1e-6)
+        recall = tp / (tp + fn + 1e-6)
+        f1 = 2 * precision * recall / (precision + recall + 1e-6)
+        
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = thresh
+    
+    return best_threshold, best_f1
+
+
+def print_final_summary(
+    metrics: Dict,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    probabilities: torch.Tensor,
+    num_classes: int,
+    class_names: Optional[List[str]] = None,
+):
+    """
+    Print comprehensive final summary including accuracy, precision, recall, F1, confusion matrix, and threshold.
+    
+    Args:
+        metrics: Dictionary of computed metrics
+        predictions: Predicted class indices [N]
+        targets: True class indices [N]
+        probabilities: Class probabilities [N, num_classes]
+        num_classes: Number of classes
+        class_names: Optional list of class names
+    """
+    if class_names is None:
+        class_names = [f"Class {i}" for i in range(num_classes)]
+    
+    # Compute confusion matrix
+    cm = compute_confusion_matrix(predictions, targets, num_classes)
+    
+    # Find optimal threshold (for binary classification)
+    optimal_threshold, threshold_f1 = find_optimal_threshold(probabilities, targets, num_classes)
+    
+    console.print("\n" + "="*80)
+    console.print("[bold cyan]FINAL TRAINING SUMMARY")
+    console.print("="*80)
+    
+    # Overall metrics
+    console.print("\n[bold yellow]Overall Metrics:")
+    console.print(f"  Accuracy: {metrics['acc1']:.4f}%")
+    console.print(f"  Precision (Macro): {metrics['precision_macro']:.4f}")
+    console.print(f"  Recall (Macro): {metrics['recall_macro']:.4f}")
+    console.print(f"  F1 Score (Macro): {metrics['f1_macro']:.4f}")
+    console.print(f"  Precision (Micro): {metrics['precision_micro']:.4f}")
+    console.print(f"  Recall (Micro): {metrics['recall_micro']:.4f}")
+    console.print(f"  F1 Score (Micro): {metrics['f1_micro']:.4f}")
+    
+    # Per-class metrics
+    console.print("\n[bold yellow]Per-Class Metrics:")
+    precision_per_class = metrics.get('precision_per_class', [])
+    recall_per_class = metrics.get('recall_per_class', [])
+    f1_per_class = metrics.get('f1_per_class', [])
+    
+    for i in range(num_classes):
+        console.print(f"\n  {class_names[i]}:")
+        console.print(f"    Precision: {precision_per_class[i]:.4f}")
+        console.print(f"    Recall: {recall_per_class[i]:.4f}")
+        console.print(f"    F1 Score: {f1_per_class[i]:.4f}")
+    
+    # Confusion matrix
+    console.print("\n[bold yellow]Confusion Matrix:")
+    console.print("  Predicted →")
+    
+    # Header row
+    header = "  Actual ↓"
+    for j in range(num_classes):
+        header += f"  {class_names[j]:>12}"
+    console.print(header)
+    console.print("  " + "-" * (13 * (num_classes + 1)))
+    
+    # Matrix rows
+    for i in range(num_classes):
+        row = f"  {class_names[i]:>10}"
+        for j in range(num_classes):
+            row += f"  {cm[i, j].item():>12}"
+        console.print(row)
+    
+    # Threshold (for binary classification)
+    if num_classes == 2:
+        console.print("\n[bold yellow]Optimal Threshold:")
+        console.print(f"  Threshold: {optimal_threshold:.4f}")
+        console.print(f"  F1 Score at threshold: {threshold_f1:.4f}")
+        console.print(f"  (Default threshold 0.5 gives F1: {metrics['f1_macro']:.4f})")
+    else:
+        console.print("\n[bold yellow]Threshold:")
+        console.print("  (Threshold finding applies to binary classification only)")
+        console.print(f"  Using default threshold: 0.5")
+    
+    console.print("\n" + "="*80 + "\n")
 
 
 def get_cosine_schedule_with_warmup(
@@ -523,6 +691,68 @@ def train(cfg: Dict):
         writer.close()
     
     console.print(f"[green]Training completed! Best {best_metric_name}: {best_metric:.4f}")
+    
+    # Run final validation with predictions for comprehensive summary
+    console.print("\n[cyan]Running final validation for comprehensive summary...")
+    final_val_results = validate_epoch(
+        model, val_loader, criterion, device, cfg["optim"]["epochs"], None, cfg, return_predictions=True
+    )
+    
+    # Get class names from dataset
+    class_names = [train_dataset.idx_to_class[i] for i in range(num_classes)]
+    
+    # Print final summary
+    print_final_summary(
+        metrics=final_val_results,
+        predictions=final_val_results["predictions"],
+        targets=final_val_results["targets"],
+        probabilities=final_val_results["probabilities"],
+        num_classes=num_classes,
+        class_names=class_names,
+    )
+    
+    # Also write summary to log file
+    log_file = open(output_dir / "log.txt", "a")
+    log_file.write("\n" + "="*80 + "\n")
+    log_file.write("FINAL TRAINING SUMMARY\n")
+    log_file.write("="*80 + "\n")
+    log_file.write(f"Accuracy: {final_val_results['acc1']:.4f}%\n")
+    log_file.write(f"Precision (Macro): {final_val_results['precision_macro']:.4f}\n")
+    log_file.write(f"Recall (Macro): {final_val_results['recall_macro']:.4f}\n")
+    log_file.write(f"F1 Score (Macro): {final_val_results['f1_macro']:.4f}\n")
+    log_file.write(f"Precision (Micro): {final_val_results['precision_micro']:.4f}\n")
+    log_file.write(f"Recall (Micro): {final_val_results['recall_micro']:.4f}\n")
+    log_file.write(f"F1 Score (Micro): {final_val_results['f1_micro']:.4f}\n")
+    
+    # Confusion matrix
+    cm = compute_confusion_matrix(
+        final_val_results["predictions"], 
+        final_val_results["targets"], 
+        num_classes
+    )
+    log_file.write("\nConfusion Matrix:\n")
+    log_file.write("  Predicted →\n")
+    header = "  Actual ↓"
+    for j in range(num_classes):
+        header += f"  {class_names[j]:>12}"
+    log_file.write(header + "\n")
+    for i in range(num_classes):
+        row = f"  {class_names[i]:>10}"
+        for j in range(num_classes):
+            row += f"  {cm[i, j].item():>12}"
+        log_file.write(row + "\n")
+    
+    # Threshold
+    if num_classes == 2:
+        optimal_threshold, threshold_f1 = find_optimal_threshold(
+            final_val_results["probabilities"],
+            final_val_results["targets"],
+            num_classes
+        )
+        log_file.write(f"\nOptimal Threshold: {optimal_threshold:.4f}\n")
+        log_file.write(f"F1 Score at threshold: {threshold_f1:.4f}\n")
+    
+    log_file.close()
 
 
 def validate(cfg: Dict):
