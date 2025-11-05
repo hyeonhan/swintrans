@@ -5,7 +5,7 @@ Training and validation engine with metrics, logging, and checkpointing.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from typing import Dict, Optional, List, Tuple
 import os
@@ -235,6 +235,191 @@ def train_epoch(
     metrics["loss"] = total_loss / num_batches
     
     return metrics
+
+
+def validate_with_fog(
+    model: nn.Module,
+    dataset: Dataset,
+    criterion: nn.Module,
+    device: torch.device,
+    cfg: Dict,
+    fog_params: Optional[Dict] = None,
+    mode_name: str = "validation",
+) -> Dict:
+    """
+    Validate model with optional fog augmentation applied on-the-fly.
+    
+    Args:
+        model: Model to validate
+        dataset: Validation dataset (should have augment=False, no duplication)
+        criterion: Loss criterion
+        device: Device to run on
+        cfg: Config dictionary
+        fog_params: Optional dict with fog parameters {beta, airlight, depth_mode, grad_angle_deg}
+                   If None, no fog is applied (clean validation)
+        mode_name: Name of validation mode (for logging)
+        
+    Returns:
+        Dictionary with metrics and optionally predictions/probabilities
+    """
+    from data import apply_fog_with_params
+    from torchvision import transforms
+    from PIL import Image
+    
+    model.eval()
+    
+    # Get transforms for validation (no augmentation)
+    img_size = cfg["data"]["img_size"]
+    rgb_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+    ])
+    rgb_normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+    
+    # DCT setup if needed
+    needs_dct = "dctswin" in cfg.get("run", {}).get("mode", "")
+    if needs_dct:
+        from dct_utils import create_dct_basis, band_split_idct
+        D = create_dct_basis(N=cfg["data"].get("dct_block", 8))
+        dct_cfg = cfg.get("dct", {})
+        c1_init_val = dct_cfg.get("c1_init", 2.0)
+        c2_init_val = dct_cfg.get("c2_init", 4.0)
+        dct_k_val = dct_cfg.get("k", 50.0)
+        use_gray_for_dct = cfg["data"].get("use_gray_for_dct", True)
+    
+    total_loss = 0.0
+    all_outputs = []
+    all_targets = []
+    batch_size = cfg["data"]["batch_size"]
+    
+    console.print(f"[cyan]Running {mode_name}...")
+    
+    with torch.no_grad():
+        # Process dataset in batches
+        for batch_start in range(0, len(dataset), batch_size):
+            rgb_batch = []
+            dct_batch = []
+            target_batch = []
+            
+            batch_end = min(batch_start + batch_size, len(dataset))
+            
+            for idx in range(batch_start, batch_end):
+                # Get the sample path and label from dataset
+                img_path, label = dataset.samples[idx]
+                
+                # Load and transform image
+                img = Image.open(img_path).convert("RGB")
+                img_tensor = rgb_transform(img)  # [3, H, W] in [0, 1]
+                
+                # Apply fog if specified
+                if fog_params is not None:
+                    # Convert to numpy for fog application
+                    rgb_np = img_tensor.permute(1, 2, 0).numpy()  # [H, W, 3]
+                    
+                    # Apply fog with specific parameters
+                    fogged_np = apply_fog_with_params(
+                        rgb_np,
+                        beta=fog_params["beta"],
+                        airlight=fog_params["airlight"],
+                        depth_mode=fog_params.get("depth_mode", "contrast"),
+                        grad_angle_deg=fog_params.get("grad_angle_deg", 90.0),
+                        contrast_radius=fog_params.get("contrast_radius", 11),
+                        contrast_gain=fog_params.get("contrast_gain", 1.2),
+                        bloom_strength=fog_params.get("bloom_strength", 0.0),
+                    )
+                    
+                    # Convert back to tensor
+                    img_tensor = torch.from_numpy(fogged_np).permute(2, 0, 1)  # [3, H, W]
+                
+                # Normalize
+                rgb_normalized = rgb_normalize(img_tensor)
+                rgb_batch.append(rgb_normalized)
+                target_batch.append(label)
+                
+                # Compute DCT if needed
+                if needs_dct:
+                    # Use fogged RGB if fog was applied, otherwise original
+                    rgb_for_dct = img_tensor
+                    
+                    # Convert to grayscale
+                    gray = 0.299 * rgb_for_dct[0] + 0.587 * rgb_for_dct[1] + 0.114 * rgb_for_dct[2]
+                    gray = gray.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+                    
+                    # Compute DCT bands
+                    c1_init = torch.tensor(c1_init_val, device=device)
+                    c2_init = torch.tensor(c2_init_val, device=device)
+                    D_device = D.to(device=device, dtype=gray.dtype)
+                    band_low, band_mid, band_high = band_split_idct(
+                        gray.to(device), c1_init, c2_init, D_device, k=dct_k_val
+                    )
+                    
+                    # Normalize bands
+                    for band in [band_low, band_mid, band_high]:
+                        band_mean = band.mean()
+                        band_std = band.std() + 1e-6
+                        band.sub_(band_mean).div_(band_std)
+                    
+                    # Create DCT tensor
+                    if use_gray_for_dct:
+                        dct_single = band_low.squeeze(0).squeeze(0)  # [H, W]
+                        dct = dct_single.unsqueeze(0).repeat(3, 1, 1)  # [3, H, W]
+                    else:
+                        dct = torch.stack([
+                            band_low.squeeze(0).squeeze(0),
+                            band_mid.squeeze(0).squeeze(0),
+                            band_high.squeeze(0).squeeze(0)
+                        ], dim=0)  # [3, H, W]
+                    
+                    # Normalize to [0, 1]
+                    dct_min = dct.min()
+                    dct_max = dct.max()
+                    if dct_max > dct_min:
+                        dct = (dct - dct_min) / (dct_max - dct_min + 1e-6)
+                    
+                    dct_batch.append(dct.cpu())
+                else:
+                    dct_batch.append(None)
+            
+            # Stack batches
+            rgb_batch = torch.stack(rgb_batch, dim=0).to(device)
+            target_batch = torch.tensor(target_batch, dtype=torch.long).to(device)
+            
+            if needs_dct and all(d is not None for d in dct_batch):
+                dct_batch = torch.stack([d.to(device) for d in dct_batch], dim=0)
+            else:
+                dct_batch = None
+            
+            # Forward
+            logits = model(rgb_batch, dct_batch)
+            
+            # Loss
+            loss = criterion(logits, target_batch)
+            
+            # Accumulate
+            total_loss += loss.item()
+            all_outputs.append(logits)
+            all_targets.append(target_batch)
+    
+    # Compute metrics
+    all_outputs = torch.cat(all_outputs, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+    
+    num_batches = (len(dataset) + batch_size - 1) // batch_size  # Ceiling division
+    metrics = compute_metrics(all_outputs, all_targets, cfg["model"]["num_classes"])
+    metrics["loss"] = total_loss / num_batches
+    
+    result = metrics.copy()
+    probs = torch.softmax(all_outputs, dim=1)
+    preds = all_outputs.argmax(dim=1)
+    result["predictions"] = preds.cpu()
+    result["probabilities"] = probs.cpu()
+    result["targets"] = all_targets.cpu()
+    
+    return result
 
 
 def validate_epoch(
@@ -692,21 +877,93 @@ def train(cfg: Dict):
     
     console.print(f"[green]Training completed! Best {best_metric_name}: {best_metric:.4f}")
     
-    # Run final validation with predictions for comprehensive summary
-    console.print("\n[cyan]Running final validation for comprehensive summary...")
-    final_val_results = validate_epoch(
-        model, val_loader, criterion, device, cfg["optim"]["epochs"], None, cfg, return_predictions=True
+    # Create clean validation dataset (no duplication, no augmentation)
+    clean_val_dataset = FireDataset(
+        root_dir=cfg["data"]["root"],
+        split="val",
+        img_size=cfg["data"]["img_size"],
+        augment=False,
+        class_to_idx=train_dataset.class_to_idx,
+        mode=mode,
+        dct_block=cfg["data"].get("dct_block", 8),
+        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+        cfg=None,  # No fog config to disable duplication
+    )
+    
+    # Run three validation modes
+    console.print("\n" + "="*80)
+    console.print("[bold cyan]FINAL VALIDATION MODES")
+    console.print("="*80)
+    
+    # 1. Clean validation (original images only)
+    clean_results = validate_with_fog(
+        model, clean_val_dataset, criterion, device, cfg,
+        fog_params=None,
+        mode_name="clean-val (original images only)"
+    )
+    
+    # 2. Robust validation - fog-light
+    fog_light_params = {
+        "beta": 0.04,
+        "airlight": 0.95,
+        "depth_mode": "contrast",
+        "grad_angle_deg": 90.0,
+        "contrast_radius": 11,
+        "contrast_gain": 1.2,
+        "bloom_strength": 0.0,
+    }
+    fog_light_results = validate_with_fog(
+        model, clean_val_dataset, criterion, device, cfg,
+        fog_params=fog_light_params,
+        mode_name="val-robust (fog-light: β=0.04, A=0.95, depth=contrast)"
+    )
+    
+    # 3. Robust validation - fog-heavy
+    fog_heavy_params = {
+        "beta": 0.08,
+        "airlight": 0.98,
+        "depth_mode": "gradient",
+        "grad_angle_deg": 90.0,
+        "contrast_radius": 11,
+        "contrast_gain": 1.2,
+        "bloom_strength": 0.0,
+    }
+    fog_heavy_results = validate_with_fog(
+        model, clean_val_dataset, criterion, device, cfg,
+        fog_params=fog_heavy_params,
+        mode_name="val-robust (fog-heavy: β=0.08, A=0.98, depth=gradient(90°))"
     )
     
     # Get class names from dataset
     class_names = [train_dataset.idx_to_class[i] for i in range(num_classes)]
     
-    # Print final summary
+    # Print summaries for all validation modes
+    console.print("\n" + "="*80)
+    console.print("[bold cyan]VALIDATION RESULTS SUMMARY")
+    console.print("="*80)
+    
+    validation_modes = [
+        ("clean-val", clean_results),
+        ("fog-light", fog_light_results),
+        ("fog-heavy", fog_heavy_results),
+    ]
+    
+    for mode_name, results in validation_modes:
+        console.print(f"\n[bold yellow]{mode_name.upper()}:")
+        console.print(f"  Accuracy: {results['acc1']:.4f}%")
+        console.print(f"  Precision (Macro): {results['precision_macro']:.4f}")
+        console.print(f"  Recall (Macro): {results['recall_macro']:.4f}")
+        console.print(f"  F1 Score (Macro): {results['f1_macro']:.4f}")
+    
+    # Print detailed summary for clean-val
+    console.print("\n" + "="*80)
+    console.print("[bold cyan]DETAILED CLEAN-VAL SUMMARY")
+    console.print("="*80)
     print_final_summary(
-        metrics=final_val_results,
-        predictions=final_val_results["predictions"],
-        targets=final_val_results["targets"],
-        probabilities=final_val_results["probabilities"],
+        metrics=clean_results,
+        predictions=clean_results["predictions"],
+        targets=clean_results["targets"],
+        probabilities=clean_results["probabilities"],
         num_classes=num_classes,
         class_names=class_names,
     )
@@ -714,20 +971,26 @@ def train(cfg: Dict):
     # Also write summary to log file
     log_file = open(output_dir / "log.txt", "a")
     log_file.write("\n" + "="*80 + "\n")
-    log_file.write("FINAL TRAINING SUMMARY\n")
+    log_file.write("FINAL VALIDATION MODES SUMMARY\n")
     log_file.write("="*80 + "\n")
-    log_file.write(f"Accuracy: {final_val_results['acc1']:.4f}%\n")
-    log_file.write(f"Precision (Macro): {final_val_results['precision_macro']:.4f}\n")
-    log_file.write(f"Recall (Macro): {final_val_results['recall_macro']:.4f}\n")
-    log_file.write(f"F1 Score (Macro): {final_val_results['f1_macro']:.4f}\n")
-    log_file.write(f"Precision (Micro): {final_val_results['precision_micro']:.4f}\n")
-    log_file.write(f"Recall (Micro): {final_val_results['recall_micro']:.4f}\n")
-    log_file.write(f"F1 Score (Micro): {final_val_results['f1_micro']:.4f}\n")
     
-    # Confusion matrix
+    for mode_name, results in validation_modes:
+        log_file.write(f"\n{mode_name.upper()}:\n")
+        log_file.write(f"  Accuracy: {results['acc1']:.4f}%\n")
+        log_file.write(f"  Precision (Macro): {results['precision_macro']:.4f}\n")
+        log_file.write(f"  Recall (Macro): {results['recall_macro']:.4f}\n")
+        log_file.write(f"  F1 Score (Macro): {results['f1_macro']:.4f}\n")
+        log_file.write(f"  Precision (Micro): {results['precision_micro']:.4f}\n")
+        log_file.write(f"  Recall (Micro): {results['recall_micro']:.4f}\n")
+        log_file.write(f"  F1 Score (Micro): {results['f1_micro']:.4f}\n")
+    
+    # Detailed clean-val confusion matrix and threshold
+    log_file.write("\n" + "="*80 + "\n")
+    log_file.write("DETAILED CLEAN-VAL SUMMARY\n")
+    log_file.write("="*80 + "\n")
     cm = compute_confusion_matrix(
-        final_val_results["predictions"], 
-        final_val_results["targets"], 
+        clean_results["predictions"], 
+        clean_results["targets"], 
         num_classes
     )
     log_file.write("\nConfusion Matrix:\n")
@@ -745,8 +1008,8 @@ def train(cfg: Dict):
     # Threshold
     if num_classes == 2:
         optimal_threshold, threshold_f1 = find_optimal_threshold(
-            final_val_results["probabilities"],
-            final_val_results["targets"],
+            clean_results["probabilities"],
+            clean_results["targets"],
             num_classes
         )
         log_file.write(f"\nOptimal Threshold: {optimal_threshold:.4f}\n")

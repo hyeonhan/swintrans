@@ -324,6 +324,63 @@ def _apply_fog_rgb(rgb_np_hwc_float01: np.ndarray, cfg: Dict, rng: random.Random
     return fogged
 
 
+def apply_fog_with_params(
+    rgb_np_hwc_float01: np.ndarray,
+    beta: float,
+    airlight: Union[float, Tuple[float, float, float]],
+    depth_mode: str = "contrast",
+    grad_angle_deg: float = 90.0,
+    contrast_radius: int = 11,
+    contrast_gain: float = 1.2,
+    bloom_strength: float = 0.0,
+) -> np.ndarray:
+    """
+    Apply fog augmentation with specific parameters (no randomness).
+    
+    Args:
+        rgb_np_hwc_float01: RGB image [H, W, 3] in float32 [0, 1]
+        beta: Attenuation coefficient
+        airlight: Airlight scalar or RGB tuple (3,)
+        depth_mode: "contrast", "gradient", or "flat"
+        grad_angle_deg: Gradient angle in degrees (for gradient mode)
+        contrast_radius: Radius for contrast-based depth
+        contrast_gain: Gain factor for contrast enhancement
+        bloom_strength: Bloom effect strength (0.0 = no bloom)
+        
+    Returns:
+        fogged: Fogged RGB image [H, W, 3] in float32 [0, 1]
+    """
+    # Build depth map with specified parameters
+    depth = _build_depth_map(
+        rgb_np_hwc_float01,
+        mode=depth_mode,
+        flat_depth=0.5,
+        grad_angle_deg=grad_angle_deg,
+        contrast_radius=contrast_radius,
+        contrast_gain=contrast_gain,
+        rng=None,
+    )
+    
+    # Apply Koschmieder fog
+    fogged = _apply_koschmieder(
+        rgb_np_hwc_float01,
+        depth,
+        beta=beta,
+        airlight=airlight,
+    )
+    
+    # Add bloom effect if specified
+    if bloom_strength > 0.0:
+        fogged = _add_bloom(
+            fogged,
+            strength=bloom_strength,
+            threshold=0.75,
+            radius=9,
+        )
+    
+    return fogged
+
+
 class FireDataset(Dataset):
     """
     Fire/nonfire classification dataset with DCT band extraction.
