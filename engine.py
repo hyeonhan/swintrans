@@ -154,6 +154,7 @@ def train_epoch(
     log_interval: int,
     writer: Optional[SummaryWriter] = None,
     cfg: Optional[Dict] = None,
+    grad_accum_steps: int = 1,
 ) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
@@ -163,9 +164,9 @@ def train_epoch(
     total_loss = 0.0
     all_outputs = []
     all_targets = []
-    all_alphas = []
     
     num_batches = len(loader)
+    optimizer.zero_grad()
     
     with Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -177,31 +178,38 @@ def train_epoch(
         task = progress.add_task(f"[cyan]Epoch {epoch} Training", total=num_batches)
         
         for batch_idx, batch in enumerate(loader):
-            rgb = batch["rgb"].to(device)
-            band_low = batch["band_low"].to(device)
-            band_mid = batch["band_mid"].to(device)
-            band_high = batch["band_high"].to(device)
-            gray = batch.get("gray", None)
-            if gray is not None:
-                gray = gray.to(device)
-            target = batch["label"].to(device)
+            # Handle tuple format: (rgb, dct, label)
+            rgb, dct, target = batch
+            rgb = rgb.to(device)
+            dct = dct.to(device) if dct is not None else None
+            target = target.to(device)
+            
+            # Sanity checks
+            assert rgb.shape[0] == target.shape[0], f"Batch size mismatch: rgb {rgb.shape[0]} vs target {target.shape[0]}"
+            assert rgb.shape[1] == 3, f"RGB should have 3 channels, got {rgb.shape[1]}"
+            img_size = cfg["data"]["img_size"] if cfg else 224
+            assert rgb.shape[2] == img_size and rgb.shape[3] == img_size, f"RGB shape should be [B, 3, {img_size}, {img_size}], got {rgb.shape}"
+            if dct is not None:
+                assert dct.shape == rgb.shape, f"DCT shape {dct.shape} must match RGB shape {rgb.shape}"
             
             # Forward
-            optimizer.zero_grad()
-            logits, alpha = model(rgb, band_low, band_mid, band_high, gray=gray)
+            logits = model(rgb, dct)
             
-            # Loss
-            loss = criterion(logits, target)
+            # Loss (normalize by grad_accum_steps)
+            loss = criterion(logits, target) / grad_accum_steps
             
             # Backward
             loss.backward()
-            optimizer.step()
+            
+            # Step optimizer every grad_accum_steps
+            if (batch_idx + 1) % grad_accum_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
             
             # Accumulate
-            total_loss += loss.item()
+            total_loss += loss.item() * grad_accum_steps  # Scale back for logging
             all_outputs.append(logits.detach())
             all_targets.append(target.detach())
-            all_alphas.append(alpha.detach().mean(0))  # Average over batch
             
             # Logging
             if (batch_idx + 1) % log_interval == 0:
@@ -212,19 +220,18 @@ def train_epoch(
                     writer.add_scalar("Train/Loss", current_loss, epoch * num_batches + batch_idx)
             
             progress.update(task, advance=1)
+        
+        # Handle remaining gradients if batch count is not divisible by grad_accum_steps
+        if num_batches % grad_accum_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad()
     
     # Compute metrics
     all_outputs = torch.cat(all_outputs, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
-    all_alphas = torch.stack(all_alphas, dim=0).mean(0)  # Average over all batches
     
     metrics = compute_metrics(all_outputs, all_targets, cfg["model"]["num_classes"] if cfg else 2)
     metrics["loss"] = total_loss / num_batches
-    
-    # Log alpha weights
-    if writer is not None:
-        for i, alpha_val in enumerate(all_alphas):
-            writer.add_scalar(f"Train/Alpha_Branch_{i}", alpha_val.item(), epoch)
     
     return metrics
 
@@ -244,21 +251,25 @@ def validate_epoch(
     total_loss = 0.0
     all_outputs = []
     all_targets = []
-    all_alphas = []
     
     with torch.no_grad():
         for batch in loader:
-            rgb = batch["rgb"].to(device)
-            band_low = batch["band_low"].to(device)
-            band_mid = batch["band_mid"].to(device)
-            band_high = batch["band_high"].to(device)
-            gray = batch.get("gray", None)
-            if gray is not None:
-                gray = gray.to(device)
-            target = batch["label"].to(device)
+            # Handle tuple format: (rgb, dct, label)
+            rgb, dct, target = batch
+            rgb = rgb.to(device)
+            dct = dct.to(device) if dct is not None else None
+            target = target.to(device)
+            
+            # Sanity checks
+            assert rgb.shape[0] == target.shape[0], f"Batch size mismatch: rgb {rgb.shape[0]} vs target {target.shape[0]}"
+            assert rgb.shape[1] == 3, f"RGB should have 3 channels, got {rgb.shape[1]}"
+            img_size = cfg["data"]["img_size"] if cfg else 224
+            assert rgb.shape[2] == img_size and rgb.shape[3] == img_size, f"RGB shape should be [B, 3, {img_size}, {img_size}], got {rgb.shape}"
+            if dct is not None:
+                assert dct.shape == rgb.shape, f"DCT shape {dct.shape} must match RGB shape {rgb.shape}"
             
             # Forward
-            logits, alpha = model(rgb, band_low, band_mid, band_high, gray=gray)
+            logits = model(rgb, dct)
             
             # Loss
             loss = criterion(logits, target)
@@ -267,27 +278,21 @@ def validate_epoch(
             total_loss += loss.item()
             all_outputs.append(logits)
             all_targets.append(target)
-            all_alphas.append(alpha.mean(0))  # Average over batch
     
     # Compute metrics
     all_outputs = torch.cat(all_outputs, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
-    all_alphas = torch.stack(all_alphas, dim=0).mean(0)
     
     metrics = compute_metrics(all_outputs, all_targets, cfg["model"]["num_classes"] if cfg else 2)
     metrics["loss"] = total_loss / len(loader)
-    metrics["alpha"] = all_alphas.cpu().tolist()  # Store alpha for printing
     
     # Log to tensorboard
     if writer is not None:
         for key, value in metrics.items():
-            if isinstance(value, (int, float)) and key != "alpha":
+            if isinstance(value, (int, float)):
                 writer.add_scalar(f"Val/{key}", value, epoch)
-            elif key == "alpha":
-                for i, alpha_val in enumerate(all_alphas):
-                    writer.add_scalar(f"Val/Alpha_Branch_{i}", alpha_val.item(), epoch)
         
-        # Log c1, c2
+        # Log c1, c2 if available
         if hasattr(model, 'get_dct_params'):
             c1, c2 = model.get_dct_params()
             writer.add_scalar("Val/DCT_c1", c1.item(), epoch)
@@ -345,11 +350,17 @@ def train(cfg: Dict):
     
     compute_dataset_stats(cfg["data"]["root"])
     
+    # Get experiment mode
+    mode = cfg.get("run", {}).get("mode", "rgbresnet_dctswin")
+    
     train_dataset = FireDataset(
         root_dir=cfg["data"]["root"],
         split="train",
         img_size=cfg["data"]["img_size"],
         augment=True,
+        mode=mode,
+        dct_block=cfg["data"].get("dct_block", 8),
+        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
     )
     val_dataset = FireDataset(
         root_dir=cfg["data"]["root"],
@@ -357,7 +368,12 @@ def train(cfg: Dict):
         img_size=cfg["data"]["img_size"],
         augment=False,
         class_to_idx=train_dataset.class_to_idx,  # Use same mapping
+        mode=mode,
+        dct_block=cfg["data"].get("dct_block", 8),
+        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
     )
+    
+    from data import collate_fn
     
     train_loader = DataLoader(
         train_dataset,
@@ -365,6 +381,7 @@ def train(cfg: Dict):
         shuffle=True,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=True,
+        collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -372,22 +389,14 @@ def train(cfg: Dict):
         shuffle=False,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=True,
+        collate_fn=collate_fn,
     )
     
     # Model
-    from models import MultiBranchClassifier
+    from models import create_model_from_cfg
     
-    model = MultiBranchClassifier(
-        feature_dim=cfg["model"]["feature_dim"],
-        num_classes=cfg["model"]["num_classes"],
-        swin_weight_sharing=cfg["model"]["swin_weight_sharing"],
-        fusion=cfg["model"]["fusion"],
-        branch_dropout=cfg["model"]["branch_dropout"],
-        freeze_backbone_epochs=cfg["model"]["freeze_backbone_epochs"],
-        dct_c1_init=cfg["dct"]["c1_init"],
-        dct_c2_init=cfg["dct"]["c2_init"],
-        dct_k=cfg["dct"]["k"],
-    ).to(device)
+    num_classes = cfg["model"]["num_classes"]
+    model = create_model_from_cfg(mode, cfg, num_classes).to(device)
     
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -396,13 +405,14 @@ def train(cfg: Dict):
     console.print(f"[cyan]Trainable parameters: {trainable_params:,}")
     
     # Loss
+    label_smoothing = cfg["optim"].get("label_smoothing", 0.05)
     if cfg["optim"]["loss"] == "focal":
         criterion = FocalLoss(
             gamma=cfg["optim"]["focal_gamma"],
             alpha=cfg["optim"]["focal_alpha"],
         )
     else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=cfg["optim"]["label_smoothing"])
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -413,9 +423,10 @@ def train(cfg: Dict):
     )
     
     # Scheduler
+    warmup_epochs = cfg.get("train", {}).get("warmup_epochs", cfg["optim"].get("warmup_epochs", 5))
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_epochs=cfg["optim"]["warmup_epochs"],
+        num_warmup_epochs=warmup_epochs,
         num_training_epochs=cfg["optim"]["epochs"],
     )
     
@@ -423,11 +434,14 @@ def train(cfg: Dict):
     best_metric = 0.0
     best_metric_name = cfg["logging"]["save_best_metric"]
     
+    # Gradient accumulation steps
+    grad_accum_steps = cfg.get("train", {}).get("grad_accum_steps", 1)
+    
     for epoch in range(1, cfg["optim"]["epochs"] + 1):
         # Train
         train_metrics = train_epoch(
             model, train_loader, optimizer, criterion, device, epoch,
-            cfg["logging"]["log_interval"], writer, cfg
+            cfg["logging"]["log_interval"], writer, cfg, grad_accum_steps
         )
         
         # Validate
@@ -439,11 +453,15 @@ def train(cfg: Dict):
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         
-        # Get c1, c2
-        c1, c2 = model.get_dct_params()
+        # Get c1, c2 if available
+        c1_str = ""
+        c2_str = ""
+        if hasattr(model, 'get_dct_params'):
+            c1, c2 = model.get_dct_params()
+            c1_str = f"c1: {c1.item():.3f} | "
+            c2_str = f"c2: {c2.item():.3f} | "
         
         # Print epoch summary
-        alpha_str = ", ".join([f"{a:.3f}" for a in val_metrics.get('alpha', [0,0,0,0])])
         summary = (
             f"Epoch {epoch}/{cfg['optim']['epochs']} | "
             f"Train Loss: {train_metrics['loss']:.4f} | "
@@ -452,8 +470,7 @@ def train(cfg: Dict):
             f"Val Acc@5: {val_metrics['acc5']:.2f}% | "
             f"Val F1-Macro: {val_metrics['f1_macro']:.4f} | "
             f"LR: {current_lr:.2e} | "
-            f"c1: {c1.item():.3f} | c2: {c2.item():.3f} | "
-            f"Alpha: [{alpha_str}]"
+            f"{c1_str}{c2_str}"
         )
         console.print(f"[yellow]{summary}")
         log_file.write(summary + "\n")
@@ -470,10 +487,13 @@ def train(cfg: Dict):
                 "scheduler_state_dict": scheduler.state_dict(),
                 "best_metric": best_metric,
                 "class_to_idx": train_dataset.class_to_idx,
-                "c1": c1.item(),
-                "c2": c2.item(),
+                "mode": mode,
             }
-            torch.save(checkpoint, output_dir / "best.pt")
+            if hasattr(model, 'get_dct_params'):
+                c1, c2 = model.get_dct_params()
+                checkpoint["c1"] = c1.item()
+                checkpoint["c2"] = c2.item()
+            torch.save(checkpoint, output_dir / "best.pth")
             console.print(f"[green]Saved best checkpoint (metric: {best_metric:.4f})")
         
         # Save last checkpoint
@@ -484,10 +504,13 @@ def train(cfg: Dict):
             "scheduler_state_dict": scheduler.state_dict(),
             "best_metric": best_metric,
             "class_to_idx": train_dataset.class_to_idx,
-            "c1": c1.item(),
-            "c2": c2.item(),
+            "mode": mode,
         }
-        torch.save(checkpoint, output_dir / "last.pt")
+        if hasattr(model, 'get_dct_params'):
+            c1, c2 = model.get_dct_params()
+            checkpoint["c1"] = c1.item()
+            checkpoint["c2"] = c2.item()
+        torch.save(checkpoint, output_dir / "last.pth")
     
     log_file.close()
     if writer is not None:
@@ -501,6 +524,9 @@ def validate(cfg: Dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     console.print(f"[green]Using device: {device}")
     
+    # Get experiment mode
+    mode = cfg.get("run", {}).get("mode", "rgbresnet_dctswin")
+    
     # Data
     from data import FireDataset
     
@@ -509,7 +535,12 @@ def validate(cfg: Dict):
         split="val",
         img_size=cfg["data"]["img_size"],
         augment=False,
+        mode=mode,
+        dct_block=cfg["data"].get("dct_block", 8),
+        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
     )
+    
+    from data import collate_fn
     
     val_loader = DataLoader(
         val_dataset,
@@ -517,29 +548,21 @@ def validate(cfg: Dict):
         shuffle=False,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=True,
+        collate_fn=collate_fn,
     )
     
     # Model
-    from models import MultiBranchClassifier
+    from models import create_model_from_cfg
     
-    model = MultiBranchClassifier(
-        feature_dim=cfg["model"]["feature_dim"],
-        num_classes=cfg["model"]["num_classes"],
-        swin_weight_sharing=cfg["model"]["swin_weight_sharing"],
-        fusion=cfg["model"]["fusion"],
-        branch_dropout=0.0,  # No dropout during validation
-        freeze_backbone_epochs=0,
-        dct_c1_init=cfg["dct"]["c1_init"],
-        dct_c2_init=cfg["dct"]["c2_init"],
-        dct_k=cfg["dct"]["k"],
-    ).to(device)
+    num_classes = cfg["model"]["num_classes"]
+    model = create_model_from_cfg(mode, cfg, num_classes).to(device)
     
     # Load checkpoint if available
     output_dir = Path(cfg["experiment"]["output_dir"])
-    checkpoint_path = output_dir / "best.pt"
+    checkpoint_path = output_dir / "best.pth"
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         console.print(f"[green]Loaded checkpoint from epoch {checkpoint['epoch']}")
     else:
         console.print("[yellow]No checkpoint found, using random initialization")

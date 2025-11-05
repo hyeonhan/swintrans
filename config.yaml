@@ -1,7 +1,9 @@
 experiment:
-  name: swin_dct_latefusion_baseline
-  output_dir: ./runs/swin_dct_latefusion_baseline
+  name: baselines_4modes
   seed: 42
+
+run:
+  mode: rgb_swin  # one of ["rgb_resnet","rgb_swin","rgbswin_dctswin","rgbresnet_dctswin"]
 
 data:
   root: ./data
@@ -12,12 +14,16 @@ data:
   use_gray_for_dct: true
 
 model:
-  feature_dim: 512
+  rgb_backbone: resnet50  # or "swin_tiny_patch4_window7_224"
+  dct_backbone: swin_tiny_patch4_window7_224
+  fusion_head_dim: 512  # MLP hidden for late fusion
   num_classes: 2
-  swin_weight_sharing: true
-  fusion: scalar  # one of: scalar, channel_gate, concat_mlp
-  branch_dropout: 0.15
-  freeze_backbone_epochs: 3
+  pretrained: true
+  freeze_stages_for_dct: 0  # e.g., 2 to freeze early stages initially
+
+train:
+  grad_accum_steps: 1
+  warmup_epochs: 5
 
 dct:
   c1_init: 2.0
@@ -28,9 +34,8 @@ optim:
   lr: 3e-4
   weight_decay: 0.05
   betas: [0.9, 0.999]
-  warmup_epochs: 5
-  epochs: 50
-  label_smoothing: 0.1
+  epochs: 1
+  label_smoothing: 0.05
   loss: ce  # ce or focal
   focal_gamma: 2.0
   focal_alpha: 0.25

@@ -6,7 +6,7 @@ Implements FireDataset with proper transforms, normalization, and DCT band extra
 
 import os
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 from collections import defaultdict
 
 import torch
@@ -38,7 +38,10 @@ class FireDataset(Dataset):
         img_size: int = 224,
         augment: bool = True,
         dct_gray: bool = True,
-        class_to_idx: Optional[Dict[str, int]] = None
+        class_to_idx: Optional[Dict[str, int]] = None,
+        mode: str = "rgbresnet_dctswin",
+        dct_block: int = 8,
+        use_gray_for_dct: bool = True,
     ):
         """
         Args:
@@ -56,6 +59,12 @@ class FireDataset(Dataset):
         self.img_size = img_size
         self.augment = augment
         self.dct_gray = dct_gray
+        self.mode = mode
+        self.dct_block = dct_block
+        self.use_gray_for_dct = use_gray_for_dct
+        
+        # Determine if DCT is needed
+        self.needs_dct = "dctswin" in mode
         
         # Find class directories
         split_dir = self.root_dir / split
@@ -109,8 +118,11 @@ class FireDataset(Dataset):
             std=[0.229, 0.224, 0.225]
         )
         
-        # DCT basis (shared across all samples)
-        self.D = create_dct_basis(N=8)
+        # DCT basis (shared across all samples) - only create if needed
+        if self.needs_dct:
+            self.D = create_dct_basis(N=dct_block)
+        else:
+            self.D = None
         
         # Running stats for band map normalization (simple per-image z-score)
         # We'll normalize each band map independently
@@ -119,14 +131,12 @@ class FireDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
         """
         Returns:
-            Dictionary with keys:
+            Tuple of (rgb, dct, label):
                 - rgb: [3, H, W] normalized RGB tensor
-                - band_low: [1, H, W] low-frequency band map
-                - band_mid: [1, H, W] mid-frequency band map
-                - band_high: [1, H, W] high-frequency band map
+                - dct: [3, H, W] DCT tensor (or None if mode doesn't need DCT)
                 - label: class index (int)
         """
         img_path, label = self.samples[idx]
@@ -141,39 +151,85 @@ class FireDataset(Dataset):
         rgb = self.rgb_transform(img)  # [3, H, W], values in [0, 1]
         rgb_normalized = self.rgb_normalize(rgb)
         
-        # Convert to grayscale for DCT (luma: 0.299R + 0.587G + 0.114B)
-        gray = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]  # [H, W]
-        gray = gray.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W] for batch dimension
+        # Compute DCT if needed
+        dct = None
+        if self.needs_dct:
+            # Convert to grayscale for DCT (luma: 0.299R + 0.587G + 0.114B)
+            gray = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]  # [H, W]
+            gray = gray.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+            
+            # Compute initial band maps with default c1=2.0, c2=4.0
+            # The model will recompute these with learnable c1, c2 during forward for gradients
+            c1_init = torch.tensor(2.0, device=gray.device)
+            c2_init = torch.tensor(4.0, device=gray.device)
+            D_device = self.D.to(device=gray.device, dtype=gray.dtype)
+            band_low, band_mid, band_high = band_split_idct(
+                gray, c1_init, c2_init, D_device, k=50.0
+            )
+            
+            # Remove batch dimension: [1, 1, H, W] -> [1, H, W]
+            band_low = band_low.squeeze(0)
+            band_mid = band_mid.squeeze(0)
+            band_high = band_high.squeeze(0)
+            
+            # Simple normalization: z-score per image
+            if self.band_normalize:
+                for band in [band_low, band_mid, band_high]:
+                    band_mean = band.mean()
+                    band_std = band.std() + 1e-6
+                    band.sub_(band_mean).div_(band_std)
+            
+            # Create DCT tensor based on use_gray_for_dct
+            if self.use_gray_for_dct:
+                # Single-channel DCT map (use low band as representative) repeated to 3 channels
+                # This preserves ImageNet pretrained weights in Swin (in_chans=3)
+                dct_single = band_low.squeeze(0)  # [H, W]
+                dct = dct_single.unsqueeze(0).repeat(3, 1, 1)  # [3, H, W]
+            else:
+                # Three-channel DCT: stack low/mid/high bands
+                dct = torch.stack([band_low.squeeze(0), band_mid.squeeze(0), band_high.squeeze(0)], dim=0)  # [3, H, W]
+            
+            # Ensure DCT is normalized to [0, 1] range
+            dct_min = dct.min()
+            dct_max = dct.max()
+            if dct_max > dct_min:
+                dct = (dct - dct_min) / (dct_max - dct_min + 1e-6)
         
-        # Compute initial band maps with default c1=2.0, c2=4.0
-        # The model will recompute these with learnable c1, c2 during forward for gradients
-        c1_init = torch.tensor(2.0, device=gray.device)
-        c2_init = torch.tensor(4.0, device=gray.device)
-        D_device = self.D.to(device=gray.device, dtype=gray.dtype)
-        band_low, band_mid, band_high = band_split_idct(
-            gray, c1_init, c2_init, D_device, k=50.0
-        )
+        return rgb_normalized, dct, label
+
+
+def collate_fn(batch):
+    """
+    Custom collate function to handle None DCT values.
+    
+    Args:
+        batch: List of (rgb, dct, label) tuples
         
-        # Remove batch dimension: [1, 1, H, W] -> [1, H, W]
-        band_low = band_low.squeeze(0)
-        band_mid = band_mid.squeeze(0)
-        band_high = band_high.squeeze(0)
-        
-        # Simple normalization: z-score per image
-        if self.band_normalize:
-            for band in [band_low, band_mid, band_high]:
-                band_mean = band.mean()
-                band_std = band.std() + 1e-6
-                band.sub_(band_mean).div_(band_std)
-        
-        return {
-            "rgb": rgb_normalized,
-            "band_low": band_low,
-            "band_mid": band_mid,
-            "band_high": band_high,
-            "gray": gray.squeeze(0),  # [1, H, W] for model to recompute bands
-            "label": label
-        }
+    Returns:
+        Tuple of (rgb_batch, dct_batch, label_batch) where dct_batch can be None
+    """
+    rgb_list, dct_list, label_list = zip(*batch)
+    
+    # Stack RGB tensors
+    rgb_batch = torch.stack(rgb_list, dim=0)
+    
+    # Stack DCT tensors if any are not None
+    if any(d is not None for d in dct_list):
+        # Filter out None values and stack
+        dct_valid = [d for d in dct_list if d is not None]
+        if len(dct_valid) == len(dct_list):
+            dct_batch = torch.stack(dct_list, dim=0)
+        else:
+            # If some are None, we shouldn't reach here in normal operation
+            # But handle it gracefully
+            dct_batch = None
+    else:
+        dct_batch = None
+    
+    # Stack labels
+    label_batch = torch.tensor(label_list, dtype=torch.long)
+    
+    return rgb_batch, dct_batch, label_batch
 
 
 def compute_dataset_stats(root: str) -> None:

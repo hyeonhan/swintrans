@@ -129,9 +129,9 @@ def infer_single(cfg: Dict, image_path: str):
     
     # Load checkpoint
     output_dir = Path(cfg["experiment"]["output_dir"])
-    checkpoint_path = output_dir / "best.pt"
+    checkpoint_path = output_dir / "best.pth"
     if not checkpoint_path.exists():
-        checkpoint_path = output_dir / "last.pt"
+        checkpoint_path = output_dir / "last.pth"
     
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -230,8 +230,9 @@ def infer_single(cfg: Dict, image_path: str):
 def main():
     parser = argparse.ArgumentParser(description="Multi-branch fire classification")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML file")
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "validate", "infer_single"],
-                       help="Mode: train, validate, or infer_single")
+    parser.add_argument("--mode", type=str, default=None, 
+                       choices=["train", "validate", "infer_single", "rgb_resnet", "rgb_swin", "rgbswin_dctswin", "rgbresnet_dctswin"],
+                       help="Mode: train/validate/infer_single (task) or rgb_resnet/rgb_swin/rgbswin_dctswin/rgbresnet_dctswin (experiment mode)")
     parser.add_argument("--image", type=str, help="Path to image for inference (required for infer_single mode)")
     parser.add_argument("--override", nargs="*", default=[], help="Config overrides in format --key.subkey=value")
     
@@ -272,6 +273,37 @@ def main():
     
     cfg = convert_scientific_notation(cfg)
     
+    # Handle mode argument: can be task mode (train/validate/infer_single) or experiment mode
+    task_mode = "train"  # default task
+    experiment_mode = None
+    
+    if args.mode:
+        if args.mode in ["train", "validate", "infer_single"]:
+            task_mode = args.mode
+            # Use experiment mode from config if not overridden
+            experiment_mode = cfg.get("run", {}).get("mode", "rgbresnet_dctswin")
+        else:
+            # It's an experiment mode
+            experiment_mode = args.mode
+            task_mode = "train"  # default to train when experiment mode is specified
+    
+    # Set experiment mode
+    if experiment_mode:
+        if "run" not in cfg:
+            cfg["run"] = {}
+        cfg["run"]["mode"] = experiment_mode
+    
+    # Resolve final experiment mode
+    final_mode = cfg.get("run", {}).get("mode", "rgbresnet_dctswin")
+    
+    # Update experiment name to include mode
+    base_name = cfg.get("experiment", {}).get("name", "baselines_4modes")
+    cfg["experiment"]["name"] = f"{base_name}-{final_mode}"
+    
+    # Set output_dir if not already set
+    if "output_dir" not in cfg.get("experiment", {}):
+        cfg["experiment"]["output_dir"] = f"./runs/{cfg['experiment']['name']}"
+    
     # Apply overrides
     if overrides:
         cfg = merge_dict(cfg, overrides)
@@ -287,19 +319,19 @@ def main():
     compute_dataset_stats(cfg["data"]["root"])
     
     # Run mode
-    if args.mode == "train":
+    if task_mode == "train":
         from engine import train
         train(cfg)
-    elif args.mode == "validate":
+    elif task_mode == "validate":
         from engine import validate
         validate(cfg)
-    elif args.mode == "infer_single":
+    elif task_mode == "infer_single":
         if not args.image:
             console.print("[red]--image is required for infer_single mode")
             sys.exit(1)
         infer_single(cfg, args.image)
     else:
-        console.print(f"[red]Unknown mode: {args.mode}")
+        console.print(f"[red]Unknown task mode: {task_mode}")
         sys.exit(1)
 
 
