@@ -444,9 +444,13 @@ class FireDataset(Dataset):
         
         # Determine if fog duplication is enabled
         # When enabled, creates 4 variants: original, fog, flip, fog+flip
-        fog_enabled = self.fog_cfg.get("enabled", False)
+        # Check split-specific flags first, fallback to legacy "enabled" flag
+        if self.split == "train":
+            fog_enabled = self.fog_cfg.get("enable_on_train", self.fog_cfg.get("enabled", False))
+        else:
+            fog_enabled = self.fog_cfg.get("enable_on_val", self.fog_cfg.get("enabled", False))
         fog_duplicate = self.fog_cfg.get("duplicate", False)
-        # Apply to both train and val if enabled
+        # Apply to train/val based on split-specific flag
         self.duplication_enabled = fog_enabled and fog_duplicate
         
         # Store original length before duplication
@@ -552,20 +556,24 @@ class FireDataset(Dataset):
         """
         # Handle duplication: map idx to source index and variant type
         # Variants: 0=original, 1=fog, 2=flip, 3=fog+flip
+        # Check split-specific flags for fog
+        if self.split == "train":
+            fog_enabled_for_split = self.fog_cfg.get("enable_on_train", self.fog_cfg.get("enabled", False))
+        else:
+            fog_enabled_for_split = self.fog_cfg.get("enable_on_val", self.fog_cfg.get("enabled", False))
+        
         if self.duplication_enabled:
             src_idx = idx % self._orig_len
             variant = idx // self._orig_len  # 0, 1, 2, or 3
             apply_flip = variant in [2, 3]  # Variants 2 and 3 are flipped
-            apply_fog = variant in [1, 3]   # Variants 1 and 3 have fog
+            # Only apply fog if enabled for this split
+            apply_fog = fog_enabled_for_split and variant in [1, 3]   # Variants 1 and 3 have fog
         else:
             src_idx = idx
             variant = 0
             apply_flip = False
-            apply_fog = False
-            fog_enabled = self.fog_cfg.get("enabled", False)
-            # If fog enabled but duplication disabled, apply fog randomly (old behavior)
-            if fog_enabled and self.split == "train":
-                apply_fog = True
+            # If fog enabled but duplication disabled, apply fog randomly (only during training)
+            apply_fog = fog_enabled_for_split and self.split == "train"
         
         img_path, label = self.samples[src_idx]
         

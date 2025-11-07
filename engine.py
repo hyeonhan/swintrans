@@ -575,6 +575,9 @@ def print_final_summary(
     probabilities: torch.Tensor,
     num_classes: int,
     class_names: Optional[List[str]] = None,
+    model: Optional[nn.Module] = None,
+    mode: Optional[str] = None,
+    cfg: Optional[Dict] = None,
 ):
     """
     Print comprehensive final summary including accuracy, precision, recall, F1, confusion matrix, and threshold.
@@ -650,6 +653,22 @@ def print_final_summary(
         console.print("\n[bold yellow]Threshold:")
         console.print("  (Threshold finding applies to binary classification only)")
         console.print(f"  Using default threshold: 0.5")
+    
+    # Print DCT parameters if mode uses DCT
+    if model is not None and mode is not None and "dctswin" in mode:
+        console.print("\n[bold yellow]DCT Parameters:")
+        if hasattr(model, 'get_dct_params'):
+            # Model has learnable DCT parameters (rgbresnet_dctswin)
+            c1, c2 = model.get_dct_params()
+            console.print(f"  c1 (learned): {c1.item():.4f}")
+            console.print(f"  c2 (learned): {c2.item():.4f}")
+        elif cfg is not None:
+            # Model uses fixed DCT parameters from config (rgbswin_dctswin)
+            dct_cfg = cfg.get("dct", {})
+            c1_init = dct_cfg.get("c1_init", 2.0)
+            c2_init = dct_cfg.get("c2_init", 4.0)
+            console.print(f"  c1 (config): {c1_init:.4f}")
+            console.print(f"  c2 (config): {c2_init:.4f}")
     
     console.print("\n" + "="*80 + "\n")
 
@@ -815,10 +834,14 @@ def train(cfg: Dict):
         # Get c1, c2 if available
         c1_str = ""
         c2_str = ""
+        c1_val = None
+        c2_val = None
         if hasattr(model, 'get_dct_params'):
             c1, c2 = model.get_dct_params()
-            c1_str = f"c1: {c1.item():.3f} | "
-            c2_str = f"c2: {c2.item():.3f} | "
+            c1_val = c1.item()
+            c2_val = c2.item()
+            c1_str = f"c1: {c1_val:.3f} | "
+            c2_str = f"c2: {c2_val:.3f} | "
         
         # Print epoch summary
         summary = (
@@ -834,6 +857,13 @@ def train(cfg: Dict):
         console.print(f"[yellow]{summary}")
         log_file.write(summary + "\n")
         log_file.flush()
+        
+        # Print updated c1 and c2 values prominently after every epoch
+        if c1_val is not None and c2_val is not None:
+            dct_info = f"[cyan]Updated DCT parameters - c1: {c1_val:.4f}, c2: {c2_val:.4f}"
+            console.print(dct_info)
+            log_file.write(f"Updated DCT parameters - c1: {c1_val:.4f}, c2: {c2_val:.4f}\n")
+            log_file.flush()
         
         # Checkpoint
         metric_value = val_metrics.get(best_metric_name, val_metrics["acc1"])
@@ -955,6 +985,22 @@ def train(cfg: Dict):
         console.print(f"  Recall (Macro): {results['recall_macro']:.4f}")
         console.print(f"  F1 Score (Macro): {results['f1_macro']:.4f}")
     
+    # Print DCT parameters if mode uses DCT
+    if "dctswin" in mode:
+        console.print("\n[bold yellow]DCT Parameters:")
+        if hasattr(model, 'get_dct_params'):
+            # Model has learnable DCT parameters (rgbresnet_dctswin)
+            c1, c2 = model.get_dct_params()
+            console.print(f"  c1 (learned): {c1.item():.4f}")
+            console.print(f"  c2 (learned): {c2.item():.4f}")
+        else:
+            # Model uses fixed DCT parameters from config (rgbswin_dctswin)
+            dct_cfg = cfg.get("dct", {})
+            c1_init = dct_cfg.get("c1_init", 2.0)
+            c2_init = dct_cfg.get("c2_init", 4.0)
+            console.print(f"  c1 (config): {c1_init:.4f}")
+            console.print(f"  c2 (config): {c2_init:.4f}")
+    
     # Print detailed summary for clean-val
     console.print("\n" + "="*80)
     console.print("[bold cyan]DETAILED CLEAN-VAL SUMMARY")
@@ -966,6 +1012,9 @@ def train(cfg: Dict):
         probabilities=clean_results["probabilities"],
         num_classes=num_classes,
         class_names=class_names,
+        model=model,
+        mode=mode,
+        cfg=cfg,
     )
     
     # Also write summary to log file
@@ -1014,6 +1063,20 @@ def train(cfg: Dict):
         )
         log_file.write(f"\nOptimal Threshold: {optimal_threshold:.4f}\n")
         log_file.write(f"F1 Score at threshold: {threshold_f1:.4f}\n")
+    
+    # DCT parameters if mode uses DCT
+    if "dctswin" in mode:
+        log_file.write("\nDCT Parameters:\n")
+        if hasattr(model, 'get_dct_params'):
+            c1, c2 = model.get_dct_params()
+            log_file.write(f"  c1 (learned): {c1.item():.4f}\n")
+            log_file.write(f"  c2 (learned): {c2.item():.4f}\n")
+        else:
+            dct_cfg = cfg.get("dct", {})
+            c1_init = dct_cfg.get("c1_init", 2.0)
+            c2_init = dct_cfg.get("c2_init", 4.0)
+            log_file.write(f"  c1 (config): {c1_init:.4f}\n")
+            log_file.write(f"  c2 (config): {c2_init:.4f}\n")
     
     log_file.close()
 

@@ -18,7 +18,7 @@ model:
   dct_backbone: swin_tiny_patch4_window7_224
   fusion_head_dim: 512  # MLP hidden for late fusion
   num_classes: 2
-  pretrained: true
+  pretrained: true 
   freeze_stages_for_dct: 0  # e.g., 2 to freeze early stages initially
 
 train:
@@ -26,8 +26,8 @@ train:
   warmup_epochs: 5
 
 dct:
-  c1_init: 3.0  # Initial threshold for low/high frequency boundary (used in data loader and FusionResNetSwin)
-  c2_init: 6.0  # Initial threshold for mid/high frequency boundary (used in data loader and FusionResNetSwin)
+  c1_init: 2.0  # Initial threshold for low/high frequency boundary (used in data loader and FusionResNetSwin)
+  c2_init: 4.0  # Initial threshold for mid/high frequency boundary (used in data loader and FusionResNetSwin)
   k: 50.0  # Slope parameter for sigmoid masks in band splitting (used in data loader and FusionResNetSwin)
 
 optim:
@@ -48,6 +48,8 @@ logging:
 augment:
   fog:
     enabled: true  # master switch
+    enable_on_train: false
+    enable_on_val: true
     duplicate: true  # doubles dataset by adding fogged copies
     apply_to: "both"  # "rgb_only" | "both"
     beta_range: [0.03, 0.10]  # attenuation β ~ thicker fog when higher
