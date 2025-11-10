@@ -401,7 +401,7 @@ class FireDataset(Dataset):
         class_to_idx: Optional[Dict[str, int]] = None,
         mode: str = "rgbresnet_dctswin",
         dct_block: int = 8,
-        use_gray_for_dct: bool = True,
+        use_three_band_dct: bool = False,
         cfg: Optional[Dict] = None,
     ):
         """
@@ -419,14 +419,34 @@ class FireDataset(Dataset):
         self.root_dir = Path(root_dir)
         self.split = split
         self.img_size = img_size
-        self.augment = augment
         self.dct_gray = dct_gray
         self.mode = mode
         self.dct_block = dct_block
-        self.use_gray_for_dct = use_gray_for_dct
+        self.use_three_band_dct = use_three_band_dct
         
         # Determine if DCT is needed
         self.needs_dct = "dctswin" in mode
+        
+        # Extract geometric augmentation config with robust fallbacks
+        # Determine augment parameter based on config and split
+        self.geometric_cfg = {}
+        if cfg is not None:
+            geometric_section = cfg.get("augment", {}).get("geometric", {})
+            if geometric_section:
+                self.geometric_cfg = geometric_section
+                # Override augment parameter based on config and split
+                if self.split == "train":
+                    self.augment = self.geometric_cfg.get("enable_on_train", self.geometric_cfg.get("enabled", augment))
+                elif self.split == "test":
+                    self.augment = self.geometric_cfg.get("enable_on_test", self.geometric_cfg.get("enabled", augment))
+                else:  # val or other
+                    self.augment = self.geometric_cfg.get("enable_on_val", self.geometric_cfg.get("enabled", augment))
+            else:
+                # No geometric config, use passed augment parameter
+                self.augment = augment
+        else:
+            # No cfg provided, use passed augment parameter
+            self.augment = augment
         
         # Extract fog config with robust fallbacks
         self.fog_cfg = {}
@@ -698,15 +718,15 @@ class FireDataset(Dataset):
                     band_std = band.std() + 1e-6
                     band.sub_(band_mean).div_(band_std)
             
-            # Create DCT tensor based on use_gray_for_dct
-            if self.use_gray_for_dct:
+            # Create DCT tensor based on use_three_band_dct
+            if self.use_three_band_dct:
+                # Three-channel DCT: stack low/mid/high bands
+                dct = torch.stack([band_low.squeeze(0), band_mid.squeeze(0), band_high.squeeze(0)], dim=0)  # [3, H, W]
+            else:
                 # Single-channel DCT map (use low band as representative) repeated to 3 channels
                 # This preserves ImageNet pretrained weights in Swin (in_chans=3)
                 dct_single = band_low.squeeze(0)  # [H, W]
                 dct = dct_single.unsqueeze(0).repeat(3, 1, 1)  # [3, H, W]
-            else:
-                # Three-channel DCT: stack low/mid/high bands
-                dct = torch.stack([band_low.squeeze(0), band_mid.squeeze(0), band_high.squeeze(0)], dim=0)  # [3, H, W]
             
             # Ensure DCT is normalized to [0, 1] range
             dct_min = dct.min()

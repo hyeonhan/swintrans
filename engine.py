@@ -289,7 +289,7 @@ def validate_with_fog(
         c1_init_val = dct_cfg.get("c1_init", 2.0)
         c2_init_val = dct_cfg.get("c2_init", 4.0)
         dct_k_val = dct_cfg.get("k", 50.0)
-        use_gray_for_dct = cfg["data"].get("use_gray_for_dct", True)
+        use_three_band_dct = cfg["data"].get("use_three_band_dct", False)
     
     total_loss = 0.0
     all_outputs = []
@@ -368,15 +368,15 @@ def validate_with_fog(
                         band.sub_(band_mean).div_(band_std)
                     
                     # Create DCT tensor
-                    if use_gray_for_dct:
-                        dct_single = band_low.squeeze(0).squeeze(0)  # [H, W]
-                        dct = dct_single.unsqueeze(0).repeat(3, 1, 1)  # [3, H, W]
-                    else:
+                    if use_three_band_dct:
                         dct = torch.stack([
                             band_low.squeeze(0).squeeze(0),
                             band_mid.squeeze(0).squeeze(0),
                             band_high.squeeze(0).squeeze(0)
                         ], dim=0)  # [3, H, W]
+                    else:
+                        dct_single = band_low.squeeze(0).squeeze(0)  # [H, W]
+                        dct = dct_single.unsqueeze(0).repeat(3, 1, 1)  # [3, H, W]
                     
                     # Normalize to [0, 1]
                     dct_min = dct.min()
@@ -707,7 +707,7 @@ def run_eval_suite(
 ) -> Dict[str, Dict]:
     """
     Runs the same evaluation suite currently used for validation, but on the given split.
-    Suites come from cfg["eval"]["robust_suites"] (e.g., ["clean","fog-light","fog-heavy"]).
+    Suites come from cfg["eval"]["val_robust_suites"] for val split or cfg["eval"]["test_robust_suites"] for test split.
     
     Args:
         model: Trained model
@@ -748,12 +748,19 @@ def run_eval_suite(
         class_to_idx=class_to_idx,
         mode=mode,
         dct_block=cfg["data"].get("dct_block", 8),
-        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+        use_three_band_dct=cfg["data"].get("use_three_band_dct", False),
         cfg=cfg,  # Pass cfg to allow split-specific fog augmentation
     )
     
-    # Get robust suites from config
-    robust_suites = cfg.get("eval", {}).get("robust_suites", ["clean", "fog-light", "fog-heavy"])
+    # Get robust suites from config based on split
+    eval_config = cfg.get("eval", {})
+    if split == "val":
+        robust_suites = eval_config.get("val_robust_suites", ["clean", "fog-light", "fog-heavy"])
+    elif split == "test":
+        robust_suites = eval_config.get("test_robust_suites", ["clean", "fog-light", "fog-heavy"])
+    else:
+        # Fallback for unknown splits
+        robust_suites = eval_config.get("val_robust_suites", ["clean", "fog-light", "fog-heavy"])
     
     # Loss criterion
     criterion = nn.CrossEntropyLoss()
@@ -777,26 +784,30 @@ def run_eval_suite(
         idx_to_class = {idx: name for name, idx in class_to_idx.items()}
         class_names = [idx_to_class[i] for i in range(num_classes)]
     
+    # Get fog parameters for each suite from config, with fallback defaults
+    fog_cfg = cfg.get("augment", {}).get("fog", {})
+    suites_config = fog_cfg.get("suites", {})
+    
     # Define fog parameters for each suite
     suite_params = {
         "clean": None,
         "fog-light": {
-            "beta": 0.04,
-            "airlight": 0.95,
-            "depth_mode": "contrast",
-            "grad_angle_deg": 90.0,
-            "contrast_radius": 11,
-            "contrast_gain": 1.2,
-            "bloom_strength": 0.0,
+            "beta": suites_config.get("fog-light", {}).get("beta", 0.04),
+            "airlight": suites_config.get("fog-light", {}).get("airlight", 0.95),
+            "depth_mode": suites_config.get("fog-light", {}).get("depth_mode", "contrast"),
+            "grad_angle_deg": suites_config.get("fog-light", {}).get("grad_angle_deg", 90.0),
+            "contrast_radius": suites_config.get("fog-light", {}).get("contrast_radius", 11),
+            "contrast_gain": suites_config.get("fog-light", {}).get("contrast_gain", 1.2),
+            "bloom_strength": suites_config.get("fog-light", {}).get("bloom_strength", 0.0),
         },
         "fog-heavy": {
-            "beta": 0.08,
-            "airlight": 0.98,
-            "depth_mode": "gradient",
-            "grad_angle_deg": 90.0,
-            "contrast_radius": 11,
-            "contrast_gain": 1.2,
-            "bloom_strength": 0.0,
+            "beta": suites_config.get("fog-heavy", {}).get("beta", 0.08),
+            "airlight": suites_config.get("fog-heavy", {}).get("airlight", 0.98),
+            "depth_mode": suites_config.get("fog-heavy", {}).get("depth_mode", "gradient"),
+            "grad_angle_deg": suites_config.get("fog-heavy", {}).get("grad_angle_deg", 90.0),
+            "contrast_radius": suites_config.get("fog-heavy", {}).get("contrast_radius", 11),
+            "contrast_gain": suites_config.get("fog-heavy", {}).get("contrast_gain", 1.2),
+            "bloom_strength": suites_config.get("fog-heavy", {}).get("bloom_strength", 0.0),
         },
     }
     
@@ -1100,21 +1111,21 @@ def train(cfg: Dict):
         root_dir=cfg["data"]["root"],
         split="train",
         img_size=cfg["data"]["img_size"],
-        augment=True,
+        augment=True,  # Default, will be overridden by config if geometric config exists
         mode=mode,
         dct_block=cfg["data"].get("dct_block", 8),
-        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+        use_three_band_dct=cfg["data"].get("use_three_band_dct", False),
         cfg=cfg,
     )
     val_dataset = FireDataset(
         root_dir=cfg["data"]["root"],
         split="val",
         img_size=cfg["data"]["img_size"],
-        augment=False,
+        augment=False,  # Default, will be overridden by config if geometric config exists
         class_to_idx=train_dataset.class_to_idx,  # Use same mapping
         mode=mode,
         dct_block=cfg["data"].get("dct_block", 8),
-        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+        use_three_band_dct=cfg["data"].get("use_three_band_dct", False),
         cfg=cfg,
     )
     
@@ -1132,7 +1143,7 @@ def train(cfg: Dict):
                 class_to_idx=train_dataset.class_to_idx,  # Use same mapping
                 mode=mode,
                 dct_block=cfg["data"].get("dct_block", 8),
-                use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+                use_three_band_dct=cfg["data"].get("use_three_band_dct", False),
                 cfg=cfg,
             )
     
@@ -1298,37 +1309,32 @@ def train(cfg: Dict):
     
     console.print(f"[green]Training completed! Best {best_metric_name}: {best_metric:.4f}")
     
-    # Run evaluation on requested splits
+    # Always run evaluation on val and test splits
     eval_config = cfg.get("eval", {})
     test_enabled = eval_config.get("test_enabled", True)
-    eval_splits = eval_config.get("splits", ["val"])
     
-    for split in eval_splits:
-        if split == "val":
-            # Always run val evaluation
+    # Always run val evaluation
+    _ = run_eval_suite(
+        model, cfg, device,
+        split="val",
+        class_to_idx=train_dataset.class_to_idx,
+        output_dir=output_dir,
+    )
+    
+    # Run test evaluation if enabled and folder exists
+    if test_enabled:
+        test_dir = Path(cfg["data"]["root"]) / "test"
+        if test_dir.exists():
             _ = run_eval_suite(
                 model, cfg, device,
-                split="val",
+                split="test",
                 class_to_idx=train_dataset.class_to_idx,
                 output_dir=output_dir,
             )
-        elif split == "test":
-            # Only run test if enabled and folder exists
-            if test_enabled:
-                test_dir = Path(cfg["data"]["root"]) / "test"
-                if test_dir.exists():
-                    _ = run_eval_suite(
-                        model, cfg, device,
-                        split="test",
-                        class_to_idx=train_dataset.class_to_idx,
-                        output_dir=output_dir,
-                    )
-                else:
-                    console.print(f"[yellow]Warning: Test directory {test_dir} does not exist. Skipping test evaluation.")
-            else:
-                console.print("[yellow]Warning: Test evaluation is disabled in config. Skipping test evaluation.")
         else:
-            console.print(f"[yellow]Warning: Unknown split '{split}'. Skipping.")
+            console.print(f"[yellow]Warning: Test directory {test_dir} does not exist. Skipping test evaluation.")
+    else:
+        console.print("[yellow]Warning: Test evaluation is disabled in config. Skipping test evaluation.")
 
 
 def validate(cfg: Dict):
@@ -1355,7 +1361,7 @@ def validate(cfg: Dict):
                     augment=False,
                     mode=mode,
                     dct_block=cfg["data"].get("dct_block", 8),
-                    use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+                    use_three_band_dct=cfg["data"].get("use_three_band_dct", False),
                     cfg=None,
                 )
                 class_to_idx = temp_dataset.class_to_idx
@@ -1391,35 +1397,30 @@ def validate(cfg: Dict):
     else:
         console.print("[yellow]No checkpoint found, using random initialization")
     
-    # Run evaluation on requested splits
+    # Always run evaluation on val and test splits
     eval_config = cfg.get("eval", {})
     test_enabled = eval_config.get("test_enabled", True)
-    eval_splits = eval_config.get("splits", ["val"])
     
-    for split in eval_splits:
-        if split == "val":
-            # Always run val evaluation
+    # Always run val evaluation
+    _ = run_eval_suite(
+        model, cfg, device,
+        split="val",
+        class_to_idx=class_to_idx,
+        output_dir=output_dir,
+    )
+    
+    # Run test evaluation if enabled and folder exists
+    if test_enabled:
+        test_dir = Path(cfg["data"]["root"]) / "test"
+        if test_dir.exists():
             _ = run_eval_suite(
                 model, cfg, device,
-                split="val",
+                split="test",
                 class_to_idx=class_to_idx,
                 output_dir=output_dir,
             )
-        elif split == "test":
-            # Only run test if enabled and folder exists
-            if test_enabled:
-                test_dir = Path(cfg["data"]["root"]) / "test"
-                if test_dir.exists():
-                    _ = run_eval_suite(
-                        model, cfg, device,
-                        split="test",
-                        class_to_idx=class_to_idx,
-                        output_dir=output_dir,
-                    )
-                else:
-                    console.print(f"[yellow]Warning: Test directory {test_dir} does not exist. Skipping test evaluation.")
-            else:
-                console.print("[yellow]Warning: Test evaluation is disabled in config. Skipping test evaluation.")
         else:
-            console.print(f"[yellow]Warning: Unknown split '{split}'. Skipping.")
+            console.print(f"[yellow]Warning: Test directory {test_dir} does not exist. Skipping test evaluation.")
+    else:
+        console.print("[yellow]Warning: Test evaluation is disabled in config. Skipping test evaluation.")
 

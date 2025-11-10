@@ -11,7 +11,7 @@ data:
   num_workers: 8
   batch_size: 32
   dct_block: 8
-  use_gray_for_dct: true
+  use_three_band_dct: true
 
 model:
   rgb_backbone: resnet50  # or "swin_tiny_patch4_window7_224"
@@ -50,13 +50,18 @@ logging:
   save_best_metric: acc1  # acc1 or f1_macro
 
 eval:
-  splits: ["val", "test"]  # choices from {"val","test"}; order respected
-  robust_suites: ["clean","fog-light","fog-heavy"]  # reuse current names
+  val_robust_suites: ["clean"]  # robust suites for validation
+  test_robust_suites: ["clean","fog-light","fog-heavy"]  # robust suites for test
   test_enabled: true  # if true and "test" folder exists, allow using it
 
 augment:
-  fog:
+  geometric:
     enabled: true  # master switch
+    enable_on_train: true
+    enable_on_val: false
+    enable_on_test: false
+  fog:
+    enabled: false  # master switch
     enable_on_train: false
     enable_on_val: false
     enable_on_test: true
@@ -76,4 +81,21 @@ augment:
     bloom_radius: 9
     seed: 1337
     debug_dump_first_n: 0  # >0 to save side-by-side samples for sanity check
+    suites:  # Parameters for fog-light and fog-heavy evaluation suites
+      fog-light:
+        beta: 0.04
+        airlight: 0.95
+        depth_mode: contrast
+        grad_angle_deg: 90.0
+        contrast_radius: 11
+        contrast_gain: 1.2
+        bloom_strength: 0.0
+      fog-heavy:
+        beta: 0.8
+        airlight: 1.0
+        depth_mode: gradient
+        grad_angle_deg: 180.0
+        contrast_radius: 15
+        contrast_gain: 1.6
+        bloom_strength: 0.1
 
