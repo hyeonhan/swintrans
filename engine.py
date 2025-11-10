@@ -693,6 +693,270 @@ def get_cosine_schedule_with_warmup(
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+def run_eval_suite(
+    model: nn.Module,
+    cfg: Dict,
+    device: torch.device,
+    split: str = "val",
+    class_to_idx: Optional[Dict[str, int]] = None,
+    output_dir: Optional[Path] = None,
+) -> Dict[str, Dict]:
+    """
+    Runs the same evaluation suite currently used for validation, but on the given split.
+    Suites come from cfg["eval"]["robust_suites"] (e.g., ["clean","fog-light","fog-heavy"]).
+    
+    Args:
+        model: Trained model
+        cfg: Config dictionary
+        device: Device to run on
+        split: Split to evaluate on ("val" or "test")
+        class_to_idx: Class name to index mapping (required)
+        output_dir: Optional output directory for saving results
+        
+    Returns:
+        Nested dict: { "clean": {...}, "fog-light": {...}, "fog-heavy": {...} }
+    """
+    from data import FireDataset
+    
+    # Get experiment mode
+    mode = cfg.get("run", {}).get("mode", "rgbresnet_dctswin")
+    num_classes = cfg["model"]["num_classes"]
+    
+    # Check if split directory exists
+    split_dir = Path(cfg["data"]["root"]) / split
+    if not split_dir.exists():
+        console.print(f"[yellow]Warning: Split directory {split_dir} does not exist. Skipping {split} evaluation.")
+        return {}
+    
+    # Check if class folders exist
+    class_dirs = sorted([d.name for d in split_dir.iterdir() if d.is_dir()])
+    if len(class_dirs) == 0:
+        console.print(f"[yellow]Warning: No class directories found in {split_dir}. Skipping {split} evaluation.")
+        return {}
+    
+    # Create clean dataset (no duplication, no augmentation)
+    clean_dataset = FireDataset(
+        root_dir=cfg["data"]["root"],
+        split=split,
+        img_size=cfg["data"]["img_size"],
+        augment=False,
+        class_to_idx=class_to_idx,
+        mode=mode,
+        dct_block=cfg["data"].get("dct_block", 8),
+        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+        cfg=None,  # No fog config to disable duplication
+    )
+    
+    # Get robust suites from config
+    robust_suites = cfg.get("eval", {}).get("robust_suites", ["clean", "fog-light", "fog-heavy"])
+    
+    # Loss criterion
+    criterion = nn.CrossEntropyLoss()
+    
+    # Print header based on split
+    if split == "val":
+        header = "FINAL VALIDATION MODES"
+    elif split == "test":
+        header = "FINAL TEST MODES"
+    else:
+        header = f"FINAL {split.upper()} MODES"
+    
+    console.print("\n" + "="*80)
+    console.print(f"[bold cyan]{header}")
+    console.print("="*80)
+    
+    # Get class names
+    if class_to_idx is None:
+        class_names = [f"Class {i}" for i in range(num_classes)]
+    else:
+        idx_to_class = {idx: name for name, idx in class_to_idx.items()}
+        class_names = [idx_to_class[i] for i in range(num_classes)]
+    
+    # Define fog parameters for each suite
+    suite_params = {
+        "clean": None,
+        "fog-light": {
+            "beta": 0.04,
+            "airlight": 0.95,
+            "depth_mode": "contrast",
+            "grad_angle_deg": 90.0,
+            "contrast_radius": 11,
+            "contrast_gain": 1.2,
+            "bloom_strength": 0.0,
+        },
+        "fog-heavy": {
+            "beta": 0.08,
+            "airlight": 0.98,
+            "depth_mode": "gradient",
+            "grad_angle_deg": 90.0,
+            "contrast_radius": 11,
+            "contrast_gain": 1.2,
+            "bloom_strength": 0.0,
+        },
+    }
+    
+    # Run evaluation for each suite
+    results = {}
+    for suite_name in robust_suites:
+        if suite_name not in suite_params:
+            console.print(f"[yellow]Warning: Unknown suite '{suite_name}', skipping.")
+            continue
+        
+        fog_params = suite_params[suite_name]
+        
+        # Determine mode name for logging
+        if suite_name == "clean":
+            mode_name = f"{split}-clean (original images only)"
+        elif suite_name == "fog-light":
+            mode_name = f"{split}-robust (fog-light: β=0.04, A=0.95, depth=contrast)"
+        elif suite_name == "fog-heavy":
+            mode_name = f"{split}-robust (fog-heavy: β=0.08, A=0.98, depth=gradient(90°))"
+        else:
+            mode_name = f"{split}-{suite_name}"
+        
+        # Run validation
+        suite_results = validate_with_fog(
+            model, clean_dataset, criterion, device, cfg,
+            fog_params=fog_params,
+            mode_name=mode_name
+        )
+        
+        results[suite_name] = suite_results
+    
+    # Print summaries for all suites
+    console.print("\n" + "="*80)
+    console.print(f"[bold cyan]{header} RESULTS SUMMARY")
+    console.print("="*80)
+    
+    for suite_name, suite_results in results.items():
+        console.print(f"\n[bold yellow]{suite_name.upper()}:")
+        console.print(f"  Accuracy: {suite_results['acc1']:.4f}%")
+        console.print(f"  Precision (Macro): {suite_results['precision_macro']:.4f}")
+        console.print(f"  Recall (Macro): {suite_results['recall_macro']:.4f}")
+        console.print(f"  F1 Score (Macro): {suite_results['f1_macro']:.4f}")
+    
+    # Print DCT parameters if mode uses DCT
+    if "dctswin" in mode:
+        console.print("\n[bold yellow]DCT Parameters:")
+        if hasattr(model, 'get_dct_params'):
+            c1, c2 = model.get_dct_params()
+            console.print(f"  c1 (learned): {c1.item():.4f}")
+            console.print(f"  c2 (learned): {c2.item():.4f}")
+        else:
+            dct_cfg = cfg.get("dct", {})
+            c1_init = dct_cfg.get("c1_init", 2.0)
+            c2_init = dct_cfg.get("c2_init", 4.0)
+            console.print(f"  c1 (config): {c1_init:.4f}")
+            console.print(f"  c2 (config): {c2_init:.4f}")
+    
+    # Print detailed summary for clean suite
+    if "clean" in results:
+        console.print("\n" + "="*80)
+        console.print(f"[bold cyan]DETAILED {split.upper()}-CLEAN SUMMARY")
+        console.print("="*80)
+        clean_results = results["clean"]
+        print_final_summary(
+            metrics=clean_results,
+            predictions=clean_results["predictions"],
+            targets=clean_results["targets"],
+            probabilities=clean_results["probabilities"],
+            num_classes=num_classes,
+            class_names=class_names,
+            model=model,
+            mode=mode,
+            cfg=cfg,
+        )
+    
+    # Save results to JSON if output_dir is provided
+    if output_dir is not None:
+        import json
+        metrics_file = output_dir / f"metrics_{split}.json"
+        
+        # Prepare JSON-serializable results
+        json_results = {}
+        for suite_name, suite_results in results.items():
+            json_results[suite_name] = {
+                k: v for k, v in suite_results.items()
+                if k not in ["predictions", "probabilities", "targets"]  # Skip tensors
+            }
+            # Convert tensors to lists for JSON
+            json_results[suite_name]["predictions"] = suite_results["predictions"].cpu().tolist()
+            json_results[suite_name]["probabilities"] = suite_results["probabilities"].cpu().tolist()
+            json_results[suite_name]["targets"] = suite_results["targets"].cpu().tolist()
+        
+        with open(metrics_file, "w") as f:
+            json.dump(json_results, f, indent=2)
+        console.print(f"[green]Saved metrics to {metrics_file}")
+    
+    # Write summary to log file if output_dir is provided
+    if output_dir is not None:
+        log_file = open(output_dir / "log.txt", "a")
+        log_file.write("\n" + "="*80 + "\n")
+        log_file.write(f"{header} SUMMARY\n")
+        log_file.write("="*80 + "\n")
+        
+        for suite_name, suite_results in results.items():
+            log_file.write(f"\n{suite_name.upper()}:\n")
+            log_file.write(f"  Accuracy: {suite_results['acc1']:.4f}%\n")
+            log_file.write(f"  Precision (Macro): {suite_results['precision_macro']:.4f}\n")
+            log_file.write(f"  Recall (Macro): {suite_results['recall_macro']:.4f}\n")
+            log_file.write(f"  F1 Score (Macro): {suite_results['f1_macro']:.4f}\n")
+            log_file.write(f"  Precision (Micro): {suite_results['precision_micro']:.4f}\n")
+            log_file.write(f"  Recall (Micro): {suite_results['recall_micro']:.4f}\n")
+            log_file.write(f"  F1 Score (Micro): {suite_results['f1_micro']:.4f}\n")
+        
+        # Detailed clean confusion matrix and threshold
+        if "clean" in results:
+            log_file.write("\n" + "="*80 + "\n")
+            log_file.write(f"DETAILED {split.upper()}-CLEAN SUMMARY\n")
+            log_file.write("="*80 + "\n")
+            clean_results = results["clean"]
+            cm = compute_confusion_matrix(
+                clean_results["predictions"],
+                clean_results["targets"],
+                num_classes
+            )
+            log_file.write("\nConfusion Matrix:\n")
+            log_file.write("  Predicted →\n")
+            header_row = "  Actual ↓"
+            for j in range(num_classes):
+                header_row += f"  {class_names[j]:>12}"
+            log_file.write(header_row + "\n")
+            for i in range(num_classes):
+                row = f"  {class_names[i]:>10}"
+                for j in range(num_classes):
+                    row += f"  {cm[i, j].item():>12}"
+                log_file.write(row + "\n")
+            
+            # Threshold
+            if num_classes == 2:
+                optimal_threshold, threshold_f1 = find_optimal_threshold(
+                    clean_results["probabilities"],
+                    clean_results["targets"],
+                    num_classes
+                )
+                log_file.write(f"\nOptimal Threshold: {optimal_threshold:.4f}\n")
+                log_file.write(f"F1 Score at threshold: {threshold_f1:.4f}\n")
+        
+        # DCT parameters if mode uses DCT
+        if "dctswin" in mode:
+            log_file.write("\nDCT Parameters:\n")
+            if hasattr(model, 'get_dct_params'):
+                c1, c2 = model.get_dct_params()
+                log_file.write(f"  c1 (learned): {c1.item():.4f}\n")
+                log_file.write(f"  c2 (learned): {c2.item():.4f}\n")
+            else:
+                dct_cfg = cfg.get("dct", {})
+                c1_init = dct_cfg.get("c1_init", 2.0)
+                c2_init = dct_cfg.get("c2_init", 4.0)
+                log_file.write(f"  c1 (config): {c1_init:.4f}\n")
+                log_file.write(f"  c2 (config): {c2_init:.4f}\n")
+        
+        log_file.close()
+    
+    return results
+
+
 def train(cfg: Dict):
     """Main training loop."""
     # Setup
@@ -907,212 +1171,79 @@ def train(cfg: Dict):
     
     console.print(f"[green]Training completed! Best {best_metric_name}: {best_metric:.4f}")
     
-    # Create clean validation dataset (no duplication, no augmentation)
-    clean_val_dataset = FireDataset(
-        root_dir=cfg["data"]["root"],
-        split="val",
-        img_size=cfg["data"]["img_size"],
-        augment=False,
-        class_to_idx=train_dataset.class_to_idx,
-        mode=mode,
-        dct_block=cfg["data"].get("dct_block", 8),
-        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
-        cfg=None,  # No fog config to disable duplication
-    )
+    # Run evaluation on requested splits
+    eval_config = cfg.get("eval", {})
+    test_enabled = eval_config.get("test_enabled", True)
+    eval_splits = eval_config.get("splits", ["val"])
     
-    # Run three validation modes
-    console.print("\n" + "="*80)
-    console.print("[bold cyan]FINAL VALIDATION MODES")
-    console.print("="*80)
-    
-    # 1. Clean validation (original images only)
-    clean_results = validate_with_fog(
-        model, clean_val_dataset, criterion, device, cfg,
-        fog_params=None,
-        mode_name="clean-val (original images only)"
-    )
-    
-    # 2. Robust validation - fog-light
-    fog_light_params = {
-        "beta": 0.04,
-        "airlight": 0.95,
-        "depth_mode": "contrast",
-        "grad_angle_deg": 90.0,
-        "contrast_radius": 11,
-        "contrast_gain": 1.2,
-        "bloom_strength": 0.0,
-    }
-    fog_light_results = validate_with_fog(
-        model, clean_val_dataset, criterion, device, cfg,
-        fog_params=fog_light_params,
-        mode_name="val-robust (fog-light: β=0.04, A=0.95, depth=contrast)"
-    )
-    
-    # 3. Robust validation - fog-heavy
-    fog_heavy_params = {
-        "beta": 0.08,
-        "airlight": 0.98,
-        "depth_mode": "gradient",
-        "grad_angle_deg": 90.0,
-        "contrast_radius": 11,
-        "contrast_gain": 1.2,
-        "bloom_strength": 0.0,
-    }
-    fog_heavy_results = validate_with_fog(
-        model, clean_val_dataset, criterion, device, cfg,
-        fog_params=fog_heavy_params,
-        mode_name="val-robust (fog-heavy: β=0.08, A=0.98, depth=gradient(90°))"
-    )
-    
-    # Get class names from dataset
-    class_names = [train_dataset.idx_to_class[i] for i in range(num_classes)]
-    
-    # Print summaries for all validation modes
-    console.print("\n" + "="*80)
-    console.print("[bold cyan]VALIDATION RESULTS SUMMARY")
-    console.print("="*80)
-    
-    validation_modes = [
-        ("clean-val", clean_results),
-        ("fog-light", fog_light_results),
-        ("fog-heavy", fog_heavy_results),
-    ]
-    
-    for mode_name, results in validation_modes:
-        console.print(f"\n[bold yellow]{mode_name.upper()}:")
-        console.print(f"  Accuracy: {results['acc1']:.4f}%")
-        console.print(f"  Precision (Macro): {results['precision_macro']:.4f}")
-        console.print(f"  Recall (Macro): {results['recall_macro']:.4f}")
-        console.print(f"  F1 Score (Macro): {results['f1_macro']:.4f}")
-    
-    # Print DCT parameters if mode uses DCT
-    if "dctswin" in mode:
-        console.print("\n[bold yellow]DCT Parameters:")
-        if hasattr(model, 'get_dct_params'):
-            # Model has learnable DCT parameters (rgbresnet_dctswin)
-            c1, c2 = model.get_dct_params()
-            console.print(f"  c1 (learned): {c1.item():.4f}")
-            console.print(f"  c2 (learned): {c2.item():.4f}")
+    for split in eval_splits:
+        if split == "val":
+            # Always run val evaluation
+            _ = run_eval_suite(
+                model, cfg, device,
+                split="val",
+                class_to_idx=train_dataset.class_to_idx,
+                output_dir=output_dir,
+            )
+        elif split == "test":
+            # Only run test if enabled and folder exists
+            if test_enabled:
+                test_dir = Path(cfg["data"]["root"]) / "test"
+                if test_dir.exists():
+                    _ = run_eval_suite(
+                        model, cfg, device,
+                        split="test",
+                        class_to_idx=train_dataset.class_to_idx,
+                        output_dir=output_dir,
+                    )
+                else:
+                    console.print(f"[yellow]Warning: Test directory {test_dir} does not exist. Skipping test evaluation.")
+            else:
+                console.print("[yellow]Warning: Test evaluation is disabled in config. Skipping test evaluation.")
         else:
-            # Model uses fixed DCT parameters from config (rgbswin_dctswin)
-            dct_cfg = cfg.get("dct", {})
-            c1_init = dct_cfg.get("c1_init", 2.0)
-            c2_init = dct_cfg.get("c2_init", 4.0)
-            console.print(f"  c1 (config): {c1_init:.4f}")
-            console.print(f"  c2 (config): {c2_init:.4f}")
-    
-    # Print detailed summary for clean-val
-    console.print("\n" + "="*80)
-    console.print("[bold cyan]DETAILED CLEAN-VAL SUMMARY")
-    console.print("="*80)
-    print_final_summary(
-        metrics=clean_results,
-        predictions=clean_results["predictions"],
-        targets=clean_results["targets"],
-        probabilities=clean_results["probabilities"],
-        num_classes=num_classes,
-        class_names=class_names,
-        model=model,
-        mode=mode,
-        cfg=cfg,
-    )
-    
-    # Also write summary to log file
-    log_file = open(output_dir / "log.txt", "a")
-    log_file.write("\n" + "="*80 + "\n")
-    log_file.write("FINAL VALIDATION MODES SUMMARY\n")
-    log_file.write("="*80 + "\n")
-    
-    for mode_name, results in validation_modes:
-        log_file.write(f"\n{mode_name.upper()}:\n")
-        log_file.write(f"  Accuracy: {results['acc1']:.4f}%\n")
-        log_file.write(f"  Precision (Macro): {results['precision_macro']:.4f}\n")
-        log_file.write(f"  Recall (Macro): {results['recall_macro']:.4f}\n")
-        log_file.write(f"  F1 Score (Macro): {results['f1_macro']:.4f}\n")
-        log_file.write(f"  Precision (Micro): {results['precision_micro']:.4f}\n")
-        log_file.write(f"  Recall (Micro): {results['recall_micro']:.4f}\n")
-        log_file.write(f"  F1 Score (Micro): {results['f1_micro']:.4f}\n")
-    
-    # Detailed clean-val confusion matrix and threshold
-    log_file.write("\n" + "="*80 + "\n")
-    log_file.write("DETAILED CLEAN-VAL SUMMARY\n")
-    log_file.write("="*80 + "\n")
-    cm = compute_confusion_matrix(
-        clean_results["predictions"], 
-        clean_results["targets"], 
-        num_classes
-    )
-    log_file.write("\nConfusion Matrix:\n")
-    log_file.write("  Predicted →\n")
-    header = "  Actual ↓"
-    for j in range(num_classes):
-        header += f"  {class_names[j]:>12}"
-    log_file.write(header + "\n")
-    for i in range(num_classes):
-        row = f"  {class_names[i]:>10}"
-        for j in range(num_classes):
-            row += f"  {cm[i, j].item():>12}"
-        log_file.write(row + "\n")
-    
-    # Threshold
-    if num_classes == 2:
-        optimal_threshold, threshold_f1 = find_optimal_threshold(
-            clean_results["probabilities"],
-            clean_results["targets"],
-            num_classes
-        )
-        log_file.write(f"\nOptimal Threshold: {optimal_threshold:.4f}\n")
-        log_file.write(f"F1 Score at threshold: {threshold_f1:.4f}\n")
-    
-    # DCT parameters if mode uses DCT
-    if "dctswin" in mode:
-        log_file.write("\nDCT Parameters:\n")
-        if hasattr(model, 'get_dct_params'):
-            c1, c2 = model.get_dct_params()
-            log_file.write(f"  c1 (learned): {c1.item():.4f}\n")
-            log_file.write(f"  c2 (learned): {c2.item():.4f}\n")
-        else:
-            dct_cfg = cfg.get("dct", {})
-            c1_init = dct_cfg.get("c1_init", 2.0)
-            c2_init = dct_cfg.get("c2_init", 4.0)
-            log_file.write(f"  c1 (config): {c1_init:.4f}\n")
-            log_file.write(f"  c2 (config): {c2_init:.4f}\n")
-    
-    log_file.close()
+            console.print(f"[yellow]Warning: Unknown split '{split}'. Skipping.")
 
 
 def validate(cfg: Dict):
-    """Validation only."""
+    """Validation only - thin wrapper around run_eval_suite."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     console.print(f"[green]Using device: {device}")
     
     # Get experiment mode
     mode = cfg.get("run", {}).get("mode", "rgbresnet_dctswin")
     
-    # Data
+    # Data - need to get class_to_idx from train or val dataset
     from data import FireDataset
     
-    val_dataset = FireDataset(
-        root_dir=cfg["data"]["root"],
-        split="val",
-        img_size=cfg["data"]["img_size"],
-        augment=False,
-        mode=mode,
-        dct_block=cfg["data"].get("dct_block", 8),
-        use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
-        cfg=cfg,
-    )
+    # Try to get class_to_idx from train dataset first, then val
+    class_to_idx = None
+    for split in ["train", "val"]:
+        split_dir = Path(cfg["data"]["root"]) / split
+        if split_dir.exists():
+            try:
+                temp_dataset = FireDataset(
+                    root_dir=cfg["data"]["root"],
+                    split=split,
+                    img_size=cfg["data"]["img_size"],
+                    augment=False,
+                    mode=mode,
+                    dct_block=cfg["data"].get("dct_block", 8),
+                    use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+                    cfg=None,
+                )
+                class_to_idx = temp_dataset.class_to_idx
+                break
+            except Exception:
+                continue
     
-    from data import collate_fn
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg["data"]["batch_size"],
-        shuffle=False,
-        num_workers=cfg["data"]["num_workers"],
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
+    if class_to_idx is None:
+        console.print("[yellow]Warning: Could not determine class_to_idx. Using default.")
+        # Fallback: try to infer from directory structure
+        split_dir = Path(cfg["data"]["root"]) / "val"
+        if split_dir.exists():
+            class_dirs = sorted([d.name for d in split_dir.iterdir() if d.is_dir()])
+            if len(class_dirs) > 0:
+                class_to_idx = {name: idx for idx, name in enumerate(class_dirs)}
     
     # Model
     from models import create_model_from_cfg
@@ -1127,23 +1258,17 @@ def validate(cfg: Dict):
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         console.print(f"[green]Loaded checkpoint from epoch {checkpoint['epoch']}")
+        # Use class_to_idx from checkpoint if available
+        if "class_to_idx" in checkpoint:
+            class_to_idx = checkpoint["class_to_idx"]
     else:
         console.print("[yellow]No checkpoint found, using random initialization")
     
-    # Loss
-    criterion = nn.CrossEntropyLoss()
-    
-    # Validate
-    val_metrics = validate_epoch(model, val_loader, criterion, device, 0, None, cfg)
-    
-    # Print results
-    console.print("\n[cyan]Validation Results:")
-    console.print(f"  Acc@1: {val_metrics['acc1']:.2f}%")
-    console.print(f"  Acc@5: {val_metrics['acc5']:.2f}%")
-    console.print(f"  Precision (macro): {val_metrics['precision_macro']:.4f}")
-    console.print(f"  Recall (macro): {val_metrics['recall_macro']:.4f}")
-    console.print(f"  F1 (macro): {val_metrics['f1_macro']:.4f}")
-    console.print(f"  Precision (micro): {val_metrics['precision_micro']:.4f}")
-    console.print(f"  Recall (micro): {val_metrics['recall_micro']:.4f}")
-    console.print(f"  F1 (micro): {val_metrics['f1_micro']:.4f}")
+    # Run evaluation suite on val split
+    _ = run_eval_suite(
+        model, cfg, device,
+        split="val",
+        class_to_idx=class_to_idx,
+        output_dir=output_dir,
+    )
 

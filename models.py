@@ -1,9 +1,10 @@
 """
-Multi-branch image classification models supporting 4 experiment modes:
+Multi-branch image classification models supporting 5 experiment modes:
 1. RGB-ResNet only
 2. RGB-Swin only
 3. RGB-Swin + DCT-Swin
 4. RGB-ResNet + DCT-Swin
+5. Swin Transformer + FPN
 """
 
 import torch
@@ -293,6 +294,110 @@ class FusionResNetSwin(nn.Module):
         return logits
 
 
+class SwinFPNClassifier(nn.Module):
+    """Swin Transformer backbone with FPN neck and classification head."""
+    
+    def __init__(
+        self,
+        rgb_backbone: str = "swin_tiny_patch4_window7_224",
+        num_classes: int = 2,
+        pretrained: bool = True,
+        fpn_dim: int = 256,
+        out_indices: Tuple[int, ...] = (1, 2, 3),
+    ):
+        super().__init__()
+        self.backbone_name = rgb_backbone
+        self.fpn_dim = fpn_dim
+        
+        # Create Swin backbone with features_only=True
+        self.backbone = timm.create_model(
+            rgb_backbone,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=out_indices,
+        )
+        
+        # Get channel dimensions from feature_info
+        channels = self.backbone.feature_info.channels()
+        print(f"SwinFPN: backbone={rgb_backbone}, channels={channels}, fpn_dim={fpn_dim}")
+        
+        # Lateral convolutions: 1x1 convs to unify channel dimensions
+        self.laterals = nn.ModuleList([
+            nn.Conv2d(c, fpn_dim, kernel_size=1) for c in channels
+        ])
+        
+        # Smoothing convolutions: 3x3 convs with GELU and optional dropout
+        self.smooths = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(fpn_dim, fpn_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Dropout(0.05),  # Small dropout as specified
+            ) for _ in channels
+        ])
+        
+        # Classification head: GAP + concat + Linear
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(3 * fpn_dim, num_classes),
+        )
+        
+    def _build_pyramid(self, feats: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Build top-down FPN pyramid.
+        
+        Args:
+            feats: List of feature maps [C3, C4, C5] from backbone (same order as out_indices)
+            
+        Returns:
+            List of pyramid features [P3, P4, P5]
+        """
+        # feats[0] = C3, feats[1] = C4, feats[2] = C5
+        # Start from top (P5)
+        p5 = self.laterals[2](feats[2])  # C5 -> P5
+        
+        # Top-down path: P4 = upsample(P5) + lateral(C4)
+        p5_up = F.interpolate(p5, scale_factor=2, mode="nearest")
+        p4 = p5_up + self.laterals[1](feats[1])  # P4
+        
+        # Top-down path: P3 = upsample(P4) + lateral(C3)
+        p4_up = F.interpolate(p4, scale_factor=2, mode="nearest")
+        p3 = p4_up + self.laterals[0](feats[0])  # P3
+        
+        # Apply smoothing convolutions
+        p3 = self.smooths[0](p3)
+        p4 = self.smooths[1](p4)
+        p5 = self.smooths[2](p5)
+        
+        return [p3, p4, p5]
+        
+    def forward(self, images: torch.Tensor, dct: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            images: RGB images [B, 3, H, W]
+            dct: Ignored (for compatibility with existing interface)
+        Returns:
+            logits: [B, num_classes]
+        """
+        # Extract multi-scale features from backbone
+        feats = self.backbone(images)  # List of [B, C_i, H_i, W_i]
+        
+        # Build FPN pyramid
+        p3, p4, p5 = self._build_pyramid(feats)
+        
+        # Global average pooling on each pyramid level
+        v3 = torch.mean(p3, dim=(2, 3))  # [B, fpn_dim]
+        v4 = torch.mean(p4, dim=(2, 3))  # [B, fpn_dim]
+        v5 = torch.mean(p5, dim=(2, 3))  # [B, fpn_dim]
+        
+        # Concatenate pooled features
+        v = torch.cat([v3, v4, v5], dim=1)  # [B, 3*fpn_dim]
+        
+        # Classification
+        logits = self.classifier(v)
+        
+        return logits
+
+
 def create_model_from_cfg(mode: str, cfg: Dict, num_classes: int) -> nn.Module:
     """
     Create model based on experiment mode and config.
@@ -356,7 +461,20 @@ def create_model_from_cfg(mode: str, cfg: Dict, num_classes: int) -> nn.Module:
             dct_k=dct_cfg.get("k", 50.0),
         )
     
+    elif mode == "swin_fpn":
+        rgb_backbone = model_cfg.get("rgb_backbone", "swin_tiny_patch4_window7_224")
+        fpn_cfg = cfg.get("fpn", {})
+        fpn_dim = fpn_cfg.get("fpn_dim", 256)
+        out_indices = tuple(fpn_cfg.get("out_indices", [1, 2, 3]))
+        model = SwinFPNClassifier(
+            rgb_backbone=rgb_backbone,
+            num_classes=num_classes,
+            pretrained=pretrained,
+            fpn_dim=fpn_dim,
+            out_indices=out_indices,
+        )
+    
     else:
-        raise ValueError(f"Unknown mode: {mode}. Must be one of: rgb_resnet, rgb_swin, rgbswin_dctswin, rgbresnet_dctswin")
+        raise ValueError(f"Unknown mode: {mode}. Must be one of: rgb_resnet, rgb_swin, rgbswin_dctswin, rgbresnet_dctswin, swin_fpn")
     
     return model

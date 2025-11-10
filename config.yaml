@@ -3,7 +3,7 @@ experiment:
   seed: 42
 
 run:
-  mode: rgbswin_dctswin  # one of ["rgb_resnet","rgb_swin","rgbswin_dctswin","rgbresnet_dctswin"]
+  mode: rgb_swin   # one of ["rgb_resnet","rgb_swin","rgbswin_dctswin","rgbresnet_dctswin","swin_fpn"]
 
 data:
   root: ./data
@@ -21,6 +21,10 @@ model:
   pretrained: true 
   freeze_stages_for_dct: 0  # e.g., 2 to freeze early stages initially
 
+fpn:
+  fpn_dim: 256  # Feature dimension for FPN layers
+  out_indices: [1, 2, 3]  # Backbone stages for C3, C4, C5 (swin_fpn mode)
+
 train:
   grad_accum_steps: 1
   warmup_epochs: 5
@@ -34,7 +38,7 @@ optim:
   lr: 3e-4
   weight_decay: 0.05
   betas: [0.9, 0.999]
-  epochs: 10
+  epochs: 50
   label_smoothing: 0.05
   loss: ce  # ce or focal
   focal_gamma: 2.0
@@ -44,6 +48,11 @@ logging:
   log_interval: 10
   tensorboard: true
   save_best_metric: acc1  # acc1 or f1_macro
+
+eval:
+  splits: ["val"]  # choices from {"val","test"}; order respected
+  robust_suites: ["clean","fog-light","fog-heavy"]  # reuse current names
+  test_enabled: true  # if true and "test" folder exists, allow using it
 
 augment:
   fog:

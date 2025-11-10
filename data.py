@@ -749,10 +749,10 @@ def collate_fn(batch):
 
 def compute_dataset_stats(root: str) -> None:
     """
-    Compute and print dataset statistics (class counts for train/val).
+    Compute and print dataset statistics (class counts for train/val/test).
     
     Args:
-        root: Root directory containing train/val folders
+        root: Root directory containing train/val/test folders
     """
     root_path = Path(root)
     
@@ -760,7 +760,7 @@ def compute_dataset_stats(root: str) -> None:
     print("Dataset Statistics")
     print("="*60)
     
-    for split in ["train", "val"]:
+    for split in ["train", "val", "test"]:
         split_dir = root_path / split
         if not split_dir.exists():
             print(f"\n{split.upper()}: Directory not found")
