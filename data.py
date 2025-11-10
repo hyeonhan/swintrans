@@ -447,7 +447,9 @@ class FireDataset(Dataset):
         # Check split-specific flags first, fallback to legacy "enabled" flag
         if self.split == "train":
             fog_enabled = self.fog_cfg.get("enable_on_train", self.fog_cfg.get("enabled", False))
-        else:
+        elif self.split == "test":
+            fog_enabled = self.fog_cfg.get("enable_on_test", self.fog_cfg.get("enabled", False))
+        else:  # val or other
             fog_enabled = self.fog_cfg.get("enable_on_val", self.fog_cfg.get("enabled", False))
         fog_duplicate = self.fog_cfg.get("duplicate", False)
         # Apply to train/val based on split-specific flag
@@ -559,7 +561,9 @@ class FireDataset(Dataset):
         # Check split-specific flags for fog
         if self.split == "train":
             fog_enabled_for_split = self.fog_cfg.get("enable_on_train", self.fog_cfg.get("enabled", False))
-        else:
+        elif self.split == "test":
+            fog_enabled_for_split = self.fog_cfg.get("enable_on_test", self.fog_cfg.get("enabled", False))
+        else:  # val or other
             fog_enabled_for_split = self.fog_cfg.get("enable_on_val", self.fog_cfg.get("enabled", False))
         
         if self.duplication_enabled:

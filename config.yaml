@@ -15,7 +15,7 @@ data:
 
 model:
   rgb_backbone: resnet50  # or "swin_tiny_patch4_window7_224"
-  dct_backbone: swin_tiny_patch4_window7_224
+  dct_backbone: swin_tiny_patch4_window7_224 
   fusion_head_dim: 512  # MLP hidden for late fusion
   num_classes: 2
   pretrained: true 
@@ -38,7 +38,7 @@ optim:
   lr: 3e-4
   weight_decay: 0.05
   betas: [0.9, 0.999]
-  epochs: 50
+  epochs: 2
   label_smoothing: 0.05
   loss: ce  # ce or focal
   focal_gamma: 2.0
@@ -50,7 +50,7 @@ logging:
   save_best_metric: acc1  # acc1 or f1_macro
 
 eval:
-  splits: ["val"]  # choices from {"val","test"}; order respected
+  splits: ["val", "test"]  # choices from {"val","test"}; order respected
   robust_suites: ["clean","fog-light","fog-heavy"]  # reuse current names
   test_enabled: true  # if true and "test" folder exists, allow using it
 
@@ -58,7 +58,8 @@ augment:
   fog:
     enabled: true  # master switch
     enable_on_train: false
-    enable_on_val: true
+    enable_on_val: false
+    enable_on_test: true
     duplicate: true  # doubles dataset by adding fogged copies
     apply_to: "both"  # "rgb_only" | "both"
     beta_range: [0.03, 0.10]  # attenuation β ~ thicker fog when higher

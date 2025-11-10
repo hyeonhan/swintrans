@@ -298,17 +298,21 @@ def validate_with_fog(
     
     console.print(f"[cyan]Running {mode_name}...")
     
+    # Get original dataset length (before duplication)
+    # If duplication is enabled, use _orig_len, otherwise use len(dataset)
+    orig_len = getattr(dataset, '_orig_len', len(dataset))
+    
     with torch.no_grad():
-        # Process dataset in batches
-        for batch_start in range(0, len(dataset), batch_size):
+        # Process dataset in batches (iterate over original samples only)
+        for batch_start in range(0, orig_len, batch_size):
             rgb_batch = []
             dct_batch = []
             target_batch = []
             
-            batch_end = min(batch_start + batch_size, len(dataset))
+            batch_end = min(batch_start + batch_size, orig_len)
             
             for idx in range(batch_start, batch_end):
-                # Get the sample path and label from dataset
+                # Get the sample path and label from dataset (use original index)
                 img_path, label = dataset.samples[idx]
                 
                 # Load and transform image
@@ -735,6 +739,7 @@ def run_eval_suite(
         return {}
     
     # Create clean dataset (no duplication, no augmentation)
+    # Pass cfg so fog augmentation can be applied based on split-specific flags
     clean_dataset = FireDataset(
         root_dir=cfg["data"]["root"],
         split=split,
@@ -744,7 +749,7 @@ def run_eval_suite(
         mode=mode,
         dct_block=cfg["data"].get("dct_block", 8),
         use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
-        cfg=None,  # No fog config to disable duplication
+        cfg=cfg,  # Pass cfg to allow split-specific fog augmentation
     )
     
     # Get robust suites from config
@@ -867,6 +872,42 @@ def run_eval_suite(
             cfg=cfg,
         )
     
+    # Print detailed summary for fog-light suite
+    if "fog-light" in results:
+        console.print("\n" + "="*80)
+        console.print(f"[bold cyan]DETAILED {split.upper()}-FOG-LIGHT SUMMARY")
+        console.print("="*80)
+        fog_light_results = results["fog-light"]
+        print_final_summary(
+            metrics=fog_light_results,
+            predictions=fog_light_results["predictions"],
+            targets=fog_light_results["targets"],
+            probabilities=fog_light_results["probabilities"],
+            num_classes=num_classes,
+            class_names=class_names,
+            model=model,
+            mode=mode,
+            cfg=cfg,
+        )
+    
+    # Print detailed summary for fog-heavy suite
+    if "fog-heavy" in results:
+        console.print("\n" + "="*80)
+        console.print(f"[bold cyan]DETAILED {split.upper()}-FOG-HEAVY SUMMARY")
+        console.print("="*80)
+        fog_heavy_results = results["fog-heavy"]
+        print_final_summary(
+            metrics=fog_heavy_results,
+            predictions=fog_heavy_results["predictions"],
+            targets=fog_heavy_results["targets"],
+            probabilities=fog_heavy_results["probabilities"],
+            num_classes=num_classes,
+            class_names=class_names,
+            model=model,
+            mode=mode,
+            cfg=cfg,
+        )
+    
     # Save results to JSON if output_dir is provided
     if output_dir is not None:
         import json
@@ -933,6 +974,72 @@ def run_eval_suite(
                 optimal_threshold, threshold_f1 = find_optimal_threshold(
                     clean_results["probabilities"],
                     clean_results["targets"],
+                    num_classes
+                )
+                log_file.write(f"\nOptimal Threshold: {optimal_threshold:.4f}\n")
+                log_file.write(f"F1 Score at threshold: {threshold_f1:.4f}\n")
+        
+        # Detailed fog-light confusion matrix and threshold
+        if "fog-light" in results:
+            log_file.write("\n" + "="*80 + "\n")
+            log_file.write(f"DETAILED {split.upper()}-FOG-LIGHT SUMMARY\n")
+            log_file.write("="*80 + "\n")
+            fog_light_results = results["fog-light"]
+            cm = compute_confusion_matrix(
+                fog_light_results["predictions"],
+                fog_light_results["targets"],
+                num_classes
+            )
+            log_file.write("\nConfusion Matrix:\n")
+            log_file.write("  Predicted →\n")
+            header_row = "  Actual ↓"
+            for j in range(num_classes):
+                header_row += f"  {class_names[j]:>12}"
+            log_file.write(header_row + "\n")
+            for i in range(num_classes):
+                row = f"  {class_names[i]:>10}"
+                for j in range(num_classes):
+                    row += f"  {cm[i, j].item():>12}"
+                log_file.write(row + "\n")
+            
+            # Threshold
+            if num_classes == 2:
+                optimal_threshold, threshold_f1 = find_optimal_threshold(
+                    fog_light_results["probabilities"],
+                    fog_light_results["targets"],
+                    num_classes
+                )
+                log_file.write(f"\nOptimal Threshold: {optimal_threshold:.4f}\n")
+                log_file.write(f"F1 Score at threshold: {threshold_f1:.4f}\n")
+        
+        # Detailed fog-heavy confusion matrix and threshold
+        if "fog-heavy" in results:
+            log_file.write("\n" + "="*80 + "\n")
+            log_file.write(f"DETAILED {split.upper()}-FOG-HEAVY SUMMARY\n")
+            log_file.write("="*80 + "\n")
+            fog_heavy_results = results["fog-heavy"]
+            cm = compute_confusion_matrix(
+                fog_heavy_results["predictions"],
+                fog_heavy_results["targets"],
+                num_classes
+            )
+            log_file.write("\nConfusion Matrix:\n")
+            log_file.write("  Predicted →\n")
+            header_row = "  Actual ↓"
+            for j in range(num_classes):
+                header_row += f"  {class_names[j]:>12}"
+            log_file.write(header_row + "\n")
+            for i in range(num_classes):
+                row = f"  {class_names[i]:>10}"
+                for j in range(num_classes):
+                    row += f"  {cm[i, j].item():>12}"
+                log_file.write(row + "\n")
+            
+            # Threshold
+            if num_classes == 2:
+                optimal_threshold, threshold_f1 = find_optimal_threshold(
+                    fog_heavy_results["probabilities"],
+                    fog_heavy_results["targets"],
                     num_classes
                 )
                 log_file.write(f"\nOptimal Threshold: {optimal_threshold:.4f}\n")
@@ -1011,9 +1118,29 @@ def train(cfg: Dict):
         cfg=cfg,
     )
     
+    # Create test dataset if enabled and exists
+    test_dataset = None
+    test_enabled = cfg.get("eval", {}).get("test_enabled", False)
+    if test_enabled:
+        test_dir = Path(cfg["data"]["root"]) / "test"
+        if test_dir.exists():
+            test_dataset = FireDataset(
+                root_dir=cfg["data"]["root"],
+                split="test",
+                img_size=cfg["data"]["img_size"],
+                augment=False,
+                class_to_idx=train_dataset.class_to_idx,  # Use same mapping
+                mode=mode,
+                dct_block=cfg["data"].get("dct_block", 8),
+                use_gray_for_dct=cfg["data"].get("use_gray_for_dct", True),
+                cfg=cfg,
+            )
+    
     # Print effective dataset lengths
     console.print(f"[cyan]Train dataset length: {len(train_dataset)}")
     console.print(f"[cyan]Val dataset length: {len(val_dataset)}")
+    if test_dataset is not None:
+        console.print(f"[cyan]Test dataset length: {len(test_dataset)}")
     
     from data import collate_fn
     
@@ -1264,11 +1391,35 @@ def validate(cfg: Dict):
     else:
         console.print("[yellow]No checkpoint found, using random initialization")
     
-    # Run evaluation suite on val split
-    _ = run_eval_suite(
-        model, cfg, device,
-        split="val",
-        class_to_idx=class_to_idx,
-        output_dir=output_dir,
-    )
+    # Run evaluation on requested splits
+    eval_config = cfg.get("eval", {})
+    test_enabled = eval_config.get("test_enabled", True)
+    eval_splits = eval_config.get("splits", ["val"])
+    
+    for split in eval_splits:
+        if split == "val":
+            # Always run val evaluation
+            _ = run_eval_suite(
+                model, cfg, device,
+                split="val",
+                class_to_idx=class_to_idx,
+                output_dir=output_dir,
+            )
+        elif split == "test":
+            # Only run test if enabled and folder exists
+            if test_enabled:
+                test_dir = Path(cfg["data"]["root"]) / "test"
+                if test_dir.exists():
+                    _ = run_eval_suite(
+                        model, cfg, device,
+                        split="test",
+                        class_to_idx=class_to_idx,
+                        output_dir=output_dir,
+                    )
+                else:
+                    console.print(f"[yellow]Warning: Test directory {test_dir} does not exist. Skipping test evaluation.")
+            else:
+                console.print("[yellow]Warning: Test evaluation is disabled in config. Skipping test evaluation.")
+        else:
+            console.print(f"[yellow]Warning: Unknown split '{split}'. Skipping.")
 
