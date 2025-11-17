@@ -582,6 +582,7 @@ def print_final_summary(
     model: Optional[nn.Module] = None,
     mode: Optional[str] = None,
     cfg: Optional[Dict] = None,
+    title: Optional[str] = None,
 ):
     """
     Print comprehensive final summary including accuracy, precision, recall, F1, confusion matrix, and threshold.
@@ -593,6 +594,7 @@ def print_final_summary(
         probabilities: Class probabilities [N, num_classes]
         num_classes: Number of classes
         class_names: Optional list of class names
+        title: Optional custom title for the summary (default: "FINAL TRAINING SUMMARY")
     """
     if class_names is None:
         class_names = [f"Class {i}" for i in range(num_classes)]
@@ -603,8 +605,11 @@ def print_final_summary(
     # Find optimal threshold (for binary classification)
     optimal_threshold, threshold_f1 = find_optimal_threshold(probabilities, targets, num_classes)
     
+    # Use custom title if provided, otherwise default
+    summary_title = title if title is not None else "FINAL TRAINING SUMMARY"
+    
     console.print("\n" + "="*80)
-    console.print("[bold cyan]FINAL TRAINING SUMMARY")
+    console.print(f"[bold cyan]{summary_title}")
     console.print("="*80)
     
     # Overall metrics
@@ -659,7 +664,7 @@ def print_final_summary(
         console.print(f"  Using default threshold: 0.5")
     
     # Print DCT parameters if mode uses DCT
-    if model is not None and mode is not None and "dctswin" in mode:
+    if model is not None and mode is not None and ("dctswin" in mode or "dct_swin" in mode):
         console.print("\n[bold yellow]DCT Parameters:")
         if hasattr(model, 'get_dct_params'):
             # Model has learnable DCT parameters (rgbresnet_dctswin)
@@ -881,9 +886,6 @@ def run_eval_suite(
     
     # Print detailed summary for clean suite
     if "clean" in results:
-        console.print("\n" + "="*80)
-        console.print(f"[bold cyan]DETAILED {split.upper()}-CLEAN SUMMARY")
-        console.print("="*80)
         clean_results = results["clean"]
         print_final_summary(
             metrics=clean_results,
@@ -895,13 +897,11 @@ def run_eval_suite(
             model=model,
             mode=mode,
             cfg=cfg,
+            title=f"DETAILED {split.upper()}-CLEAN SUMMARY",
         )
     
-    # Print detailed summary for fog-light suite
+    # Print detailed summary for fog-light suite (includes confusion matrix)
     if "fog-light" in results:
-        console.print("\n" + "="*80)
-        console.print(f"[bold cyan]DETAILED {split.upper()}-FOG-LIGHT SUMMARY")
-        console.print("="*80)
         fog_light_results = results["fog-light"]
         print_final_summary(
             metrics=fog_light_results,
@@ -913,13 +913,11 @@ def run_eval_suite(
             model=model,
             mode=mode,
             cfg=cfg,
+            title=f"DETAILED {split.upper()}-FOG-LIGHT SUMMARY",
         )
     
-    # Print detailed summary for fog-heavy suite
+    # Print detailed summary for fog-heavy suite (includes confusion matrix)
     if "fog-heavy" in results:
-        console.print("\n" + "="*80)
-        console.print(f"[bold cyan]DETAILED {split.upper()}-FOG-HEAVY SUMMARY")
-        console.print("="*80)
         fog_heavy_results = results["fog-heavy"]
         print_final_summary(
             metrics=fog_heavy_results,
@@ -931,6 +929,7 @@ def run_eval_suite(
             model=model,
             mode=mode,
             cfg=cfg,
+            title=f"DETAILED {split.upper()}-FOG-HEAVY SUMMARY",
         )
     
     # Save results to JSON if output_dir is provided

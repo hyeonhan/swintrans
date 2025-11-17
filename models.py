@@ -1,10 +1,11 @@
 """
-Multi-branch image classification models supporting 5 experiment modes:
+Multi-branch image classification models supporting 6 experiment modes:
 1. RGB-ResNet only
 2. RGB-Swin only
-3. RGB-Swin + DCT-Swin
-4. RGB-ResNet + DCT-Swin
-5. Swin Transformer + FPN
+3. DCT-Swin only (DCT-IDCT-Swin transformer branch)
+4. RGB-Swin + DCT-Swin
+5. RGB-ResNet + DCT-Swin
+6. Swin Transformer + FPN
 """
 
 import torch
@@ -161,6 +162,37 @@ class RGBSwinOnly(nn.Module):
             logits: [B, num_classes]
         """
         features = extract_features_from_backbone(self.backbone, images, self.backbone_type)
+        logits = self.classifier(features)
+        return logits
+
+
+class DCTSwinOnly(nn.Module):
+    """DCT-Swin only model (uses only DCT-IDCT-Swin transformer branch)."""
+    
+    def __init__(
+        self,
+        dct_backbone: str = "swin_tiny_patch4_window7_224",
+        num_classes: int = 2,
+        pretrained: bool = True,
+    ):
+        super().__init__()
+        self.backbone_name = dct_backbone
+        self.backbone, backbone_dim = get_backbone_features(dct_backbone, pretrained)
+        self.backbone_type = "swin"
+        
+        # Classifier
+        self.classifier = nn.Linear(backbone_dim, num_classes)
+        
+    def forward(self, images: torch.Tensor, dct: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            images: RGB images [B, 3, H, W] (ignored, for compatibility)
+            dct: DCT tensor [B, 3, H, W] (required for this model)
+        Returns:
+            logits: [B, num_classes]
+        """
+        assert dct is not None, "DCT input is required for DCTSwinOnly model"
+        features = extract_features_from_backbone(self.backbone, dct, self.backbone_type)
         logits = self.classifier(features)
         return logits
 
@@ -418,7 +450,7 @@ def create_model_from_cfg(mode: str, cfg: Dict, num_classes: int) -> nn.Module:
     Create model based on experiment mode and config.
     
     Args:
-        mode: Experiment mode ("rgb_resnet", "rgb_swin", "rgbswin_dctswin", "rgbresnet_dctswin")
+        mode: Experiment mode ("rgb_resnet", "rgb_swin", "dct_swin", "rgbswin_dctswin", "rgbresnet_dctswin", "swin_fpn")
         cfg: Configuration dictionary
         num_classes: Number of classes
         
@@ -440,6 +472,14 @@ def create_model_from_cfg(mode: str, cfg: Dict, num_classes: int) -> nn.Module:
         rgb_backbone = model_cfg.get("rgb_backbone", "swin_tiny_patch4_window7_224")
         model = RGBSwinOnly(
             rgb_backbone=rgb_backbone,
+            num_classes=num_classes,
+            pretrained=pretrained,
+        )
+    
+    elif mode == "dct_swin":
+        dct_backbone = model_cfg.get("dct_backbone", "swin_tiny_patch4_window7_224")
+        model = DCTSwinOnly(
+            dct_backbone=dct_backbone,
             num_classes=num_classes,
             pretrained=pretrained,
         )
@@ -490,6 +530,6 @@ def create_model_from_cfg(mode: str, cfg: Dict, num_classes: int) -> nn.Module:
         )
     
     else:
-        raise ValueError(f"Unknown mode: {mode}. Must be one of: rgb_resnet, rgb_swin, rgbswin_dctswin, rgbresnet_dctswin, swin_fpn")
+        raise ValueError(f"Unknown mode: {mode}. Must be one of: rgb_resnet, rgb_swin, dct_swin, rgbswin_dctswin, rgbresnet_dctswin, swin_fpn")
     
     return model

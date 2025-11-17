@@ -425,7 +425,7 @@ class FireDataset(Dataset):
         self.use_three_band_dct = use_three_band_dct
         
         # Determine if DCT is needed
-        self.needs_dct = "dctswin" in mode
+        self.needs_dct = "dctswin" in mode or "dct_swin" in mode
         
         # Extract geometric augmentation config with robust fallbacks
         # Determine augment parameter based on config and split

@@ -231,8 +231,8 @@ def main():
     parser = argparse.ArgumentParser(description="Multi-branch fire classification")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML file")
     parser.add_argument("--mode", type=str, default=None, 
-                       choices=["train", "validate", "infer_single", "rgb_resnet", "rgb_swin", "rgbswin_dctswin", "rgbresnet_dctswin", "swin_fpn"],
-                       help="Mode: train/validate/infer_single (task) or rgb_resnet/rgb_swin/rgbswin_dctswin/rgbresnet_dctswin/swin_fpn (experiment mode)")
+                       choices=["train", "validate", "infer_single", "rgb_resnet", "rgb_swin", "dct_swin", "rgbswin_dctswin", "rgbresnet_dctswin", "swin_fpn"],
+                       help="Mode: train/validate/infer_single (task) or rgb_resnet/rgb_swin/dct_swin/rgbswin_dctswin/rgbresnet_dctswin/swin_fpn (experiment mode)")
     parser.add_argument("--image", type=str, help="Path to image for inference (required for infer_single mode)")
     parser.add_argument("--override", nargs="*", default=[], help="Config overrides in format --key.subkey=value")
     
