@@ -824,9 +824,23 @@ def run_eval_suite(
         if suite_name == "clean":
             mode_name = f"{split}-clean (original images only)"
         elif suite_name == "fog-light":
-            mode_name = f"{split}-robust (fog-light: β=0.04, A=0.95, depth=contrast)"
+            beta = fog_params["beta"]
+            airlight = fog_params["airlight"]
+            depth_mode = fog_params["depth_mode"]
+            grad_angle = fog_params.get("grad_angle_deg", 90.0)
+            if depth_mode == "gradient":
+                mode_name = f"{split}-robust (fog-light: β={beta}, A={airlight}, depth={depth_mode}({grad_angle}°))"
+            else:
+                mode_name = f"{split}-robust (fog-light: β={beta}, A={airlight}, depth={depth_mode})"
         elif suite_name == "fog-heavy":
-            mode_name = f"{split}-robust (fog-heavy: β=0.08, A=0.98, depth=gradient(90°))"
+            beta = fog_params["beta"]
+            airlight = fog_params["airlight"]
+            depth_mode = fog_params["depth_mode"]
+            grad_angle = fog_params.get("grad_angle_deg", 90.0)
+            if depth_mode == "gradient":
+                mode_name = f"{split}-robust (fog-heavy: β={beta}, A={airlight}, depth={depth_mode}({grad_angle}°))"
+            else:
+                mode_name = f"{split}-robust (fog-heavy: β={beta}, A={airlight}, depth={depth_mode})"
         else:
             mode_name = f"{split}-{suite_name}"
         

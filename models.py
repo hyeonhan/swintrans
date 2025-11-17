@@ -346,22 +346,37 @@ class SwinFPNClassifier(nn.Module):
         Build top-down FPN pyramid.
         
         Args:
-            feats: List of feature maps [C3, C4, C5] from backbone (same order as out_indices)
+            feats: List of feature maps [C3, C4, C5] from backbone
+                   NOTE: TIMM Swin returns [B, H, W, C] (channels-last)
             
         Returns:
-            List of pyramid features [P3, P4, P5]
+            List of pyramid features [P3, P4, P5] (channels-first)
         """
+        # --- START: 수정된 부분 ---
+        # Permute from [B, H, W, C] to [B, C, H, W]
+        # timm 백본이 채널-라스트 형식으로 반환하므로 채널-퍼스트로 변경합니다.
+        try:
+            feats_ch_first = [f.permute(0, 3, 1, 2) for f in feats]
+        except Exception as e:
+            # permute가 실패할 경우를 대비한 디버깅 로그
+            print(f"Error permuting features. Shapes: {[f.shape for f in feats]}")
+            raise e
+        # --- END: 수정된 부분 ---
+
         # feats[0] = C3, feats[1] = C4, feats[2] = C5
         # Start from top (P5)
-        p5 = self.laterals[2](feats[2])  # C5 -> P5
+        # 수정: feats_ch_first 사용
+        p5 = self.laterals[2](feats_ch_first[2])  # C5 -> P5
         
         # Top-down path: P4 = upsample(P5) + lateral(C4)
         p5_up = F.interpolate(p5, scale_factor=2, mode="nearest")
-        p4 = p5_up + self.laterals[1](feats[1])  # P4
+        # 수정: feats_ch_first 사용
+        p4 = p5_up + self.laterals[1](feats_ch_first[1])  # P4
         
         # Top-down path: P3 = upsample(P4) + lateral(C3)
         p4_up = F.interpolate(p4, scale_factor=2, mode="nearest")
-        p3 = p4_up + self.laterals[0](feats[0])  # P3
+        # 수정: feats_ch_first 사용
+        p3 = p4_up + self.laterals[0](feats_ch_first[0])  # P3
         
         # Apply smoothing convolutions
         p3 = self.smooths[0](p3)

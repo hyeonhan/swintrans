@@ -718,6 +718,12 @@ class FireDataset(Dataset):
                     band_std = band.std() + 1e-6
                     band.sub_(band_mean).div_(band_std)
             
+            # # give extra weight to high band 
+            # w_low, w_mid, w_high = 1.0, 1.0, 1.5
+            # band_low = band_low * w_low
+            # band_mid = band_mid * w_mid
+            # band_high = band_high * w_high
+            
             # Create DCT tensor based on use_three_band_dct
             if self.use_three_band_dct:
                 # Three-channel DCT: stack low/mid/high bands
